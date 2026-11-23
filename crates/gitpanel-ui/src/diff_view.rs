@@ -80,6 +80,10 @@ pub fn diff_view(
                 );
                 return;
             }
+            if file.line_count() > 20_000 {
+                info_banner(ui, &translator.text(keys::DIFF_TOO_LARGE), palette);
+                return;
+            }
             let highlights = highlighter.highlight_file(file);
             match state.mode {
                 DiffMode::Unified => {

@@ -886,6 +886,7 @@ impl GitPanelApp {
                 }
             };
             if let Ok(payload) = serde_json::to_string(&files)
+                && payload.len() <= 4_000_000
                 && let Err(error) = db.put_diff_cache(repo_id, &base_key, &head_key, &payload)
             {
                 tracing::warn!(%error, "could not cache diff");

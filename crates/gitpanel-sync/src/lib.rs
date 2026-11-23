@@ -465,6 +465,7 @@ async fn sync_one(
                 cursor.as_deref(),
             )
             .await?;
+        let mut rate_limited = false;
         if let Some(rate) = page.rate_limit {
             let _ = events.send(SyncEvent::RateLimit {
                 limit: rate.limit,
@@ -473,16 +474,17 @@ async fn sync_one(
             });
             if rate.remaining == 0 {
                 rate_limited_until = Some(rate.reset_at);
-                incomplete = page.has_next;
-                if page.has_next {
-                    break;
-                }
+                rate_limited = true;
             }
         }
         let page_len = page.commits.len() as u32;
         db.upsert_commits(repo.github_id, &repo.default_branch, &page.commits)?;
         added = added.saturating_add(page_len);
         pages += 1;
+        if rate_limited {
+            incomplete = page.has_next;
+            break;
+        }
         if !page.has_next {
             break;
         }
