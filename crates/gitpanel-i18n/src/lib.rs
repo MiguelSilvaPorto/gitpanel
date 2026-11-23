@@ -1,3 +1,9 @@
+//! Interface translations.
+//!
+//! Each locale is a directory under `locales/<tag>/` containing Fluent
+//! catalogs. To add a language, create that directory, add the resources to
+//! `LOCALES`, and run the tests: the parity test checks every key in
+//! `keys::ALL` against every registered catalog.
 #![forbid(unsafe_code)]
 
 pub mod keys;
