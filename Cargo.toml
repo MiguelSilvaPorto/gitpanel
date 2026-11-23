@@ -1,0 +1,63 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/gitpanel",
+    "crates/gitpanel-ui",
+    "crates/gitpanel-core",
+    "crates/gitpanel-github",
+    "crates/gitpanel-db",
+    "crates/gitpanel-sync",
+    "crates/gitpanel-diff",
+    "crates/gitpanel-metrics",
+    "crates/gitpanel-config",
+    "crates/gitpanel-i18n",
+    "crates/gitpanel-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.100"
+license = "MIT OR Apache-2.0"
+authors = ["MiguelSilvaPorto <94987317+MiguelSilvaPorto@users.noreply.github.com>"]
+repository = "https://github.com/MiguelSilvaPorto/gitpanel"
+
+[workspace.dependencies]
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4.5", features = ["derive"] }
+crossbeam-channel = "0.5"
+directories = "6"
+eframe = { version = "0.37", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+egui = "0.37"
+egui_extras = { version = "0.37", default-features = false }
+egui_plot = "0.38"
+fluent-bundle = "0.16"
+reqwest = { version = "0.12", default-features = false, features = ["json", "gzip", "rustls-tls"] }
+rusqlite = { version = "0.43", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+syntect = { version = "5.3", default-features = false, features = ["default-fancy"] }
+sys-locale = "0.3"
+tempfile = "3"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+unic-langid = "0.9"
+wiremock = "0.6"
+zeroize = "1"
+
+[profile.dev]
+debug = 1
+incremental = true
+lto = false
+
+[profile.dev.package."*"]
+debug = false
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

@@ -1,0 +1,19 @@
+[package]
+name = "gitpanel-sync"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+chrono.workspace = true
+crossbeam-channel.workspace = true
+gitpanel-config = { path = "../gitpanel-config" }
+gitpanel-core = { path = "../gitpanel-core" }
+gitpanel-db = { path = "../gitpanel-db" }
+gitpanel-github = { path = "../gitpanel-github" }
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true

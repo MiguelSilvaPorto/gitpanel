@@ -1,0 +1,31 @@
+[package]
+name = "gitpanel"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "gitpanel"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+eframe.workspace = true
+egui.workspace = true
+gitpanel-config = { path = "../gitpanel-config" }
+gitpanel-core = { path = "../gitpanel-core" }
+gitpanel-db = { path = "../gitpanel-db" }
+gitpanel-diff = { path = "../gitpanel-diff" }
+gitpanel-github = { path = "../gitpanel-github" }
+gitpanel-i18n = { path = "../gitpanel-i18n" }
+gitpanel-metrics = { path = "../gitpanel-metrics" }
+gitpanel-sync = { path = "../gitpanel-sync" }
+gitpanel-ui = { path = "../gitpanel-ui" }
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

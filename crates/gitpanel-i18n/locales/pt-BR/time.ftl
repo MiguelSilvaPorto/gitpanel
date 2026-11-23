@@ -1,0 +1,14 @@
+time-now = agora
+time-minute-ago = há { $count } minuto
+time-minutes-ago = há { $count } minutos
+time-hour-ago = há { $count } hora
+time-hours-ago = há { $count } horas
+time-day-ago = há { $count } dia
+time-days-ago = há { $count } dias
+time-month-ago = há { $count } mês
+time-months-ago = há { $count } meses
+time-year-ago = há { $count } ano
+time-years-ago = há { $count } anos
+time-in-minutes = em { $count } minutos
+time-in-hours = em { $count } horas
+time-unknown = data desconhecida

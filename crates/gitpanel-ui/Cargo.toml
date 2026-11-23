@@ -1,0 +1,19 @@
+[package]
+name = "gitpanel-ui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+chrono.workspace = true
+egui.workspace = true
+egui_extras.workspace = true
+egui_plot.workspace = true
+gitpanel-config = { path = "../gitpanel-config" }
+gitpanel-core = { path = "../gitpanel-core" }
+gitpanel-diff = { path = "../gitpanel-diff" }
+gitpanel-i18n = { path = "../gitpanel-i18n" }
+gitpanel-metrics = { path = "../gitpanel-metrics" }

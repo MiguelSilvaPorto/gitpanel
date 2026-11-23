@@ -1,0 +1,573 @@
+use std::sync::Arc;
+use std::time::Duration;
+
+use chrono::{DateTime, Utc};
+use gitpanel_core::{
+    Account, Branch, CommitData, CommitDiffResult, CompareResult, CreateRepoRequest, FilePatch,
+    RateLimit, Repository,
+};
+use reqwest::header::{ACCEPT, HeaderMap};
+use reqwest::{Client, RequestBuilder, StatusCode};
+use serde_json::{Value, json};
+
+use crate::auth::Token;
+use crate::dto::{BranchDto, CommitDetailDto, CompareDto, FileDto, RepoDto, UserDto};
+use crate::error::GithubError;
+
+const API_BASE: &str = "https://api.github.com";
+const PER_PAGE: usize = 100;
+const COMPARE_FILE_LIMIT: usize = 300;
+
+#[derive(Debug, Clone)]
+pub struct CommitPage {
+    pub commits: Vec<CommitData>,
+    pub has_next: bool,
+    pub end_cursor: Option<String>,
+    pub rate_limit: Option<RateLimit>,
+}
+
+#[derive(Clone)]
+pub struct GithubClient {
+    http: Client,
+    token: Arc<Token>,
+    api_base: String,
+}
+
+impl GithubClient {
+    pub fn from_gh() -> Result<Self, GithubError> {
+        Self::new(Token::from_gh()?)
+    }
+
+    pub fn new(token: Token) -> Result<Self, GithubError> {
+        Self::with_base(token, API_BASE)
+    }
+
+    pub fn with_base(token: Token, api_base: impl Into<String>) -> Result<Self, GithubError> {
+        let http = Client::builder()
+            .user_agent("gitpanel/0.1.0")
+            .timeout(Duration::from_secs(30))
+            .gzip(true)
+            .build()?;
+        Ok(Self {
+            http,
+            token: Arc::new(token),
+            api_base: api_base.into().trim_end_matches('/').to_owned(),
+        })
+    }
+
+    pub async fn get_account(&self) -> Result<Account, GithubError> {
+        let request = self.http.get(format!("{}/user", self.api_base));
+        let (_, headers, body) = self.send(request).await?;
+        let user: UserDto = decode(&body, "user")?;
+        let scopes = headers
+            .get("x-oauth-scopes")
+            .and_then(|value| value.to_str().ok())
+            .map(|value| {
+                value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|scope| !scope.is_empty())
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(Account {
+            login: user.login,
+            name: user.name,
+            avatar_url: user.avatar_url,
+            scopes,
+        })
+    }
+
+    pub async fn list_repositories(&self) -> Result<Vec<Repository>, GithubError> {
+        let mut repositories = Vec::new();
+        let mut page = 1u32;
+        loop {
+            let page_value = page.to_string();
+            let request = self
+                .http
+                .get(format!("{}/user/repos", self.api_base))
+                .query(&[
+                    ("affiliation", "owner,collaborator,organization_member"),
+                    ("visibility", "all"),
+                    ("sort", "updated"),
+                    ("direction", "desc"),
+                    ("per_page", "100"),
+                    ("page", page_value.as_str()),
+                ]);
+            let (_, _, body) = self.send(request).await?;
+            let page_items: Vec<RepoDto> = decode(&body, "repository list")?;
+            let count = page_items.len();
+            repositories.extend(page_items.into_iter().map(repository_from_dto));
+            if count < PER_PAGE || page >= 1000 {
+                break;
+            }
+            page += 1;
+        }
+        Ok(repositories)
+    }
+
+    pub async fn create_repository(
+        &self,
+        request: &CreateRepoRequest,
+    ) -> Result<Repository, GithubError> {
+        let mut body = serde_json::Map::new();
+        body.insert("name".to_owned(), json!(&request.name));
+        body.insert("private".to_owned(), json!(request.private));
+        body.insert("auto_init".to_owned(), json!(request.auto_init));
+        if let Some(description) = &request.description
+            && !description.trim().is_empty()
+        {
+            body.insert("description".to_owned(), json!(description));
+        }
+        if let Some(template) = &request.gitignore_template
+            && !template.is_empty()
+        {
+            body.insert("gitignore_template".to_owned(), json!(template));
+        }
+        if let Some(template) = &request.license_template
+            && !template.is_empty()
+        {
+            body.insert("license_template".to_owned(), json!(template));
+        }
+        let http_request = self
+            .http
+            .post(format!("{}/user/repos", self.api_base))
+            .json(&Value::Object(body));
+        let (_, _, response) = self.send(http_request).await?;
+        let dto: RepoDto = decode(&response, "created repository")?;
+        Ok(repository_from_dto(dto))
+    }
+
+    pub async fn list_branches(&self, owner: &str, repo: &str) -> Result<Vec<Branch>, GithubError> {
+        let mut branches = Vec::new();
+        let mut page = 1u32;
+        loop {
+            let page_value = page.to_string();
+            let request = self
+                .http
+                .get(format!("{}/repos/{owner}/{repo}/branches", self.api_base))
+                .query(&[("per_page", "100"), ("page", page_value.as_str())]);
+            let (_, _, body) = self.send(request).await?;
+            let page_items: Vec<BranchDto> = decode(&body, "branch list")?;
+            let count = page_items.len();
+            branches.extend(page_items.into_iter().map(|branch| Branch {
+                name: branch.name,
+                sha: branch.commit.sha,
+                protected: branch.protected,
+            }));
+            if count < PER_PAGE || page >= 1000 {
+                break;
+            }
+            page += 1;
+        }
+        Ok(branches)
+    }
+
+    pub async fn compare(
+        &self,
+        owner: &str,
+        repo: &str,
+        base_sha: &str,
+        head_sha: &str,
+    ) -> Result<CompareResult, GithubError> {
+        let request = self.http.get(format!(
+            "{}/repos/{owner}/{repo}/compare/{base_sha}...{head_sha}",
+            self.api_base
+        ));
+        let (_, _, body) = self.send(request).await?;
+        let dto: CompareDto = decode(&body, "compare")?;
+        let truncated = dto.files.len() >= COMPARE_FILE_LIMIT;
+        Ok(CompareResult {
+            files: dto.files.into_iter().map(file_from_dto).collect(),
+            total_commits: dto.total_commits,
+            ahead_by: dto.ahead_by,
+            behind_by: dto.behind_by,
+            truncated,
+        })
+    }
+
+    pub async fn commit_diff(
+        &self,
+        owner: &str,
+        repo: &str,
+        sha: &str,
+    ) -> Result<CommitDiffResult, GithubError> {
+        let request = self.http.get(format!(
+            "{}/repos/{owner}/{repo}/commits/{sha}",
+            self.api_base
+        ));
+        let (_, _, body) = self.send(request).await?;
+        let dto: CommitDetailDto = decode(&body, "commit diff")?;
+        let truncated = dto.files.len() >= COMPARE_FILE_LIMIT;
+        Ok(CommitDiffResult {
+            sha: sha.to_owned(),
+            files: dto.files.into_iter().map(file_from_dto).collect(),
+            truncated,
+        })
+    }
+
+    pub async fn fetch_commits_page(
+        &self,
+        owner: &str,
+        repo: &str,
+        branch: &str,
+        since: DateTime<Utc>,
+        cursor: Option<&str>,
+    ) -> Result<CommitPage, GithubError> {
+        let body = json!({
+            "query": COMMIT_QUERY,
+            "variables": {
+                "owner": owner,
+                "name": repo,
+                "branch": format!("refs/heads/{branch}"),
+                "since": since.to_rfc3339(),
+                "cursor": cursor,
+            }
+        });
+        let request = self
+            .http
+            .post(format!("{}/graphql", self.api_base))
+            .json(&body);
+        let (_, _, response) = self.send(request).await?;
+        let root: Value = serde_json::from_str(&response).map_err(|error| GithubError::Decode {
+            context: "GraphQL commits".to_owned(),
+            details: error.to_string(),
+        })?;
+
+        if root["errors"].is_array() && root["data"].is_null() {
+            let message = root["errors"]
+                .as_array()
+                .and_then(|errors| errors.first())
+                .and_then(|error| error["message"].as_str())
+                .unwrap_or("unknown GraphQL error")
+                .to_owned();
+            return Err(GithubError::GraphQl { message });
+        }
+
+        let rate_limit = parse_rate_limit(&root["data"]["rateLimit"]);
+        let repository = &root["data"]["repository"];
+        if repository.is_null() {
+            return Err(GithubError::NotFound {
+                message: format!("{owner}/{repo}"),
+            });
+        }
+
+        let history = &repository["ref"]["target"]["history"];
+        if history.is_null() {
+            return Ok(CommitPage {
+                commits: Vec::new(),
+                has_next: false,
+                end_cursor: None,
+                rate_limit,
+            });
+        }
+
+        let mut commits = Vec::new();
+        if let Some(nodes) = history["nodes"].as_array() {
+            for node in nodes {
+                let Some(sha) = node["oid"].as_str() else {
+                    continue;
+                };
+                let Some(committed_at) = node["committedDate"]
+                    .as_str()
+                    .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+                    .map(|value| value.with_timezone(&Utc))
+                else {
+                    continue;
+                };
+                let author = &node["author"];
+                let committer = &node["committer"];
+                let author_login = author["user"]["login"]
+                    .as_str()
+                    .or_else(|| committer["user"]["login"].as_str())
+                    .map(str::to_owned);
+                let author_name = author["name"]
+                    .as_str()
+                    .or_else(|| committer["name"].as_str())
+                    .unwrap_or("Desconhecido")
+                    .to_owned();
+                let author_email = author["email"]
+                    .as_str()
+                    .or_else(|| committer["email"].as_str())
+                    .map(str::to_owned);
+                commits.push(CommitData {
+                    sha: sha.to_owned(),
+                    author_login,
+                    author_name,
+                    author_email,
+                    committed_at,
+                    message: node["messageHeadline"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_owned(),
+                    additions: node["additions"].as_u64().unwrap_or(0).min(u32::MAX as u64) as u32,
+                    deletions: node["deletions"].as_u64().unwrap_or(0).min(u32::MAX as u64) as u32,
+                    is_merge: node["parents"]["totalCount"].as_u64().unwrap_or(0) > 1,
+                });
+            }
+        }
+
+        Ok(CommitPage {
+            commits,
+            has_next: history["pageInfo"]["hasNextPage"]
+                .as_bool()
+                .unwrap_or(false),
+            end_cursor: history["pageInfo"]["endCursor"].as_str().map(str::to_owned),
+            rate_limit,
+        })
+    }
+
+    async fn send(
+        &self,
+        request: RequestBuilder,
+    ) -> Result<(StatusCode, HeaderMap, String), GithubError> {
+        let response = request
+            .bearer_auth(self.token.expose())
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .header(ACCEPT, "application/vnd.github+json")
+            .send()
+            .await?;
+        let status = response.status();
+        let headers = response.headers().clone();
+        let body = response.text().await?;
+        if !status.is_success() {
+            return Err(GithubError::from_http(status, &headers, &body));
+        }
+        Ok((status, headers, body))
+    }
+}
+
+fn repository_from_dto(dto: RepoDto) -> Repository {
+    let visibility = dto
+        .visibility
+        .unwrap_or_else(|| (if dto.private { "private" } else { "public" }).to_owned());
+    Repository {
+        github_id: dto.id,
+        owner: dto.owner.login,
+        name: dto.name,
+        full_name: dto.full_name,
+        description: dto.description,
+        private: dto.private,
+        visibility,
+        fork: dto.fork,
+        archived: dto.archived,
+        default_branch: dto.default_branch,
+        language: dto.language,
+        stars: dto.stargazers_count,
+        permissions_admin: dto.permissions.map(|value| value.admin).unwrap_or(false),
+        html_url: dto.html_url,
+        updated_at: dto.updated_at,
+        pushed_at: dto.pushed_at,
+        synced_at: None,
+        monitored: true,
+        last_sync_error: None,
+    }
+}
+
+fn file_from_dto(dto: FileDto) -> FilePatch {
+    FilePatch {
+        filename: dto.filename,
+        previous_filename: dto.previous_filename,
+        status: dto.status,
+        additions: dto.additions,
+        deletions: dto.deletions,
+        changes: dto.changes,
+        patch: dto.patch,
+    }
+}
+
+fn parse_rate_limit(value: &Value) -> Option<RateLimit> {
+    let limit = value["limit"].as_u64()? as u32;
+    let remaining = value["remaining"].as_u64().unwrap_or(0) as u32;
+    let reset_at = value["resetAt"]
+        .as_str()
+        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+        .map(|value| value.with_timezone(&Utc))?;
+    Some(RateLimit {
+        limit,
+        remaining,
+        reset_at,
+        cost: value["cost"].as_u64().map(|value| value as u32),
+    })
+}
+
+fn decode<T: serde::de::DeserializeOwned>(body: &str, context: &str) -> Result<T, GithubError> {
+    serde_json::from_str(body).map_err(|error| GithubError::Decode {
+        context: context.to_owned(),
+        details: error.to_string(),
+    })
+}
+
+const COMMIT_QUERY: &str = r#"
+query($owner: String!, $name: String!, $branch: String!, $since: GitTimestamp!, $cursor: String) {
+  repository(owner: $owner, name: $name) {
+    ref(qualifiedName: $branch) {
+      target {
+        ... on Commit {
+          history(first: 100, since: $since, after: $cursor) {
+            pageInfo { hasNextPage endCursor }
+            nodes {
+              oid
+              messageHeadline
+              committedDate
+              additions
+              deletions
+              author { name email user { login } }
+              committer { name email user { login } }
+              parents(first: 2) { totalCount }
+            }
+          }
+        }
+      }
+    }
+  }
+  rateLimit { limit remaining resetAt cost }
+}
+"#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn lists_repositories() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/user/repos"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!([{
+                    "id": 1,
+                    "name": "gitpanel",
+                    "full_name": "MiguelSilvaPorto/gitpanel",
+                    "owner": { "login": "MiguelSilvaPorto" },
+                    "description": "Painel",
+                    "private": false,
+                    "visibility": "public",
+                    "fork": false,
+                    "archived": false,
+                    "default_branch": "main",
+                    "language": "Rust",
+                    "stargazers_count": 4,
+                    "permissions": { "admin": true },
+                    "html_url": "https://github.com/MiguelSilvaPorto/gitpanel",
+                    "updated_at": "2026-01-01T00:00:00Z",
+                    "pushed_at": "2026-01-02T00:00:00Z"
+                }])),
+            )
+            .mount(&server)
+            .await;
+
+        let client = GithubClient::with_base(Token::new("test"), server.uri()).expect("client");
+        let repos = client.list_repositories().await.expect("repos");
+        assert_eq!(repos.len(), 1);
+        assert_eq!(repos[0].full_name, "MiguelSilvaPorto/gitpanel");
+        assert!(repos[0].permissions_admin);
+    }
+
+    #[tokio::test]
+    async fn maps_forbidden_to_rate_limit() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/user"))
+            .respond_with(
+                ResponseTemplate::new(403)
+                    .insert_header("x-ratelimit-remaining", "0")
+                    .insert_header("x-ratelimit-reset", "1770000000")
+                    .set_body_string("{\"message\":\"API rate limit exceeded\"}"),
+            )
+            .mount(&server)
+            .await;
+        let client = GithubClient::with_base(Token::new("test"), server.uri()).expect("client");
+        let error = client.get_account().await.expect_err("rate limited");
+        assert!(error.is_rate_limited());
+    }
+
+    #[tokio::test]
+    async fn creates_a_repository() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/user/repos"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "id": 42,
+                "name": "new-repo",
+                "full_name": "MiguelSilvaPorto/new-repo",
+                "owner": { "login": "MiguelSilvaPorto" },
+                "description": "created",
+                "private": true,
+                "visibility": "private",
+                "fork": false,
+                "archived": false,
+                "default_branch": "main",
+                "language": null,
+                "stargazers_count": 0,
+                "permissions": { "admin": true },
+                "html_url": "https://github.com/MiguelSilvaPorto/new-repo",
+                "updated_at": "2026-01-01T00:00:00Z",
+                "pushed_at": null
+            })))
+            .mount(&server)
+            .await;
+        let client = GithubClient::with_base(Token::new("test"), server.uri()).expect("client");
+        let repository = client
+            .create_repository(&CreateRepoRequest {
+                name: "new-repo".to_owned(),
+                description: Some("created".to_owned()),
+                private: true,
+                auto_init: true,
+                gitignore_template: Some("Rust".to_owned()),
+                license_template: Some("mit".to_owned()),
+            })
+            .await
+            .expect("created");
+        assert_eq!(repository.full_name, "MiguelSilvaPorto/new-repo");
+        assert!(repository.private);
+    }
+
+    #[tokio::test]
+    async fn parses_graphql_commit_pages() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {
+                    "repository": {
+                        "ref": {
+                            "target": {
+                                "history": {
+                                    "pageInfo": { "hasNextPage": false, "endCursor": null },
+                                    "nodes": [{
+                                        "oid": "abc123",
+                                        "messageHeadline": "feat: initial",
+                                        "committedDate": "2026-01-02T03:04:05Z",
+                                        "additions": 10,
+                                        "deletions": 2,
+                                        "author": { "name": "Miguel", "email": "m@example.com", "user": { "login": "miguel" } },
+                                        "committer": { "name": "Miguel", "email": "m@example.com", "user": { "login": "miguel" } },
+                                        "parents": { "totalCount": 1 }
+                                    }]
+                                }
+                            }
+                        }
+                    },
+                    "rateLimit": { "limit": 5000, "remaining": 4999, "resetAt": "2026-01-02T04:00:00Z", "cost": 1 }
+                }
+            })))
+            .mount(&server)
+            .await;
+        let client = GithubClient::with_base(Token::new("test"), server.uri()).expect("client");
+        let page = client
+            .fetch_commits_page("MiguelSilvaPorto", "gitpanel", "main", Utc::now(), None)
+            .await
+            .expect("page");
+        assert_eq!(page.commits.len(), 1);
+        assert_eq!(page.commits[0].sha, "abc123");
+        assert_eq!(page.commits[0].additions, 10);
+        assert_eq!(
+            page.rate_limit.as_ref().map(|rate| rate.remaining),
+            Some(4999)
+        );
+    }
+}

@@ -1,0 +1,19 @@
+[package]
+name = "gitpanel-i18n"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+fluent-bundle.workspace = true
+serde.workspace = true
+sys-locale.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+unic-langid.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
