@@ -44,7 +44,13 @@ code-committed = Commit criado.
 code-edit-conflict = O arquivo foi alterado no GitHub. Recarregue antes de salvar.
 code-edit-unavailable = Este arquivo não pode ser editado.
 code-files-title = Arquivos do repositório
-code-files-summary = { $files } arquivos · { $dirs } pastas
+code-files-summary = { $files } { $files ->
+        [one] arquivo
+       *[other] arquivos
+    } · { $dirs } { $dirs ->
+        [one] pasta
+       *[other] pastas
+    }
 code-tree-partial = parcial
 code-tree-truncated = O GitHub limitou a listagem desta árvore; alguns arquivos podem não aparecer.
 code-close-viewer = Fechar visualizador
@@ -53,6 +59,20 @@ code-editing-mode = Editando
 code-commit-placeholder = Descreva a alteração
 code-commit-default = Atualiza { $path }
 code-view-truncated = Exibindo os primeiros 50.000 caracteres. Abra no GitHub para ver o arquivo completo.
+code-files-name = Nome
+code-files-size = Tamanho
+code-go-to-file = Ir para arquivo
+code-go-to-file-empty = Nenhum arquivo encontrado.
+code-clone = Código
+code-clone-copied = URL do repositório copiada.
+code-about = Sobre
+code-languages = Idiomas
+code-no-releases = Nenhuma release publicada.
+code-view-releases = Ver releases
+code-branches-count = { $count } { $count ->
+        [one] branch
+       *[other] branches
+    }
 
 branches-title = Branches
 branches-empty = Nenhum branch sincronizado.

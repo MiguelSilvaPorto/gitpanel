@@ -25,6 +25,11 @@ pub enum Icon {
     Folder,
     File,
     Pencil,
+    Code,
+    Issue,
+    Pull,
+    Play,
+    Tag,
 }
 
 pub fn icon_button(ui: &mut Ui, icon: Icon, tooltip: &str) -> Response {
@@ -409,6 +414,78 @@ pub fn draw(ui: &Ui, icon: Icon, rect: Rect, color: Color32) {
                 ],
                 stroke,
             );
+        }
+        Icon::Code => {
+            painter.add(Shape::line(
+                vec![
+                    Pos2::new(center.x - 2.0, r.top() + 3.0),
+                    Pos2::new(r.left() + 2.0, center.y),
+                    Pos2::new(center.x - 2.0, r.bottom() - 3.0),
+                ],
+                stroke,
+            ));
+            painter.add(Shape::line(
+                vec![
+                    Pos2::new(center.x + 2.0, r.top() + 3.0),
+                    Pos2::new(r.right() - 2.0, center.y),
+                    Pos2::new(center.x + 2.0, r.bottom() - 3.0),
+                ],
+                stroke,
+            ));
+            painter.line_segment(
+                [
+                    Pos2::new(center.x + 4.0, r.top()),
+                    Pos2::new(center.x - 4.0, r.bottom()),
+                ],
+                Stroke::new(1.0, color),
+            );
+        }
+        Icon::Issue => {
+            painter.circle_stroke(center, r.width() * 0.42, stroke);
+            painter.circle_filled(center, 1.8, color);
+        }
+        Icon::Pull => {
+            painter.circle_stroke(Pos2::new(center.x - 5.0, r.top() + 3.0), 2.5, stroke);
+            painter.circle_stroke(Pos2::new(center.x + 5.0, r.bottom() - 3.0), 2.5, stroke);
+            painter.line_segment(
+                [
+                    Pos2::new(center.x - 5.0, r.top() + 6.0),
+                    Pos2::new(center.x - 5.0, r.bottom() - 6.0),
+                ],
+                stroke,
+            );
+            painter.add(Shape::line(
+                vec![
+                    Pos2::new(center.x - 3.0, r.top() + 9.0),
+                    Pos2::new(center.x + 3.0, center.y),
+                    Pos2::new(center.x + 5.0, center.y + 1.0),
+                ],
+                stroke,
+            ));
+        }
+        Icon::Play => {
+            painter.add(Shape::closed_line(
+                vec![
+                    Pos2::new(r.left() + 3.0, r.top() + 1.0),
+                    Pos2::new(r.right() - 2.0, center.y),
+                    Pos2::new(r.left() + 3.0, r.bottom() - 1.0),
+                ],
+                stroke,
+            ));
+        }
+        Icon::Tag => {
+            painter.add(Shape::line(
+                vec![
+                    Pos2::new(r.left() + 1.0, center.y),
+                    Pos2::new(center.x, r.top() + 1.0),
+                    Pos2::new(r.right() - 1.0, r.top() + 1.0),
+                    Pos2::new(r.right() - 1.0, center.y + 4.0),
+                    Pos2::new(center.x, r.bottom() - 1.0),
+                    Pos2::new(r.left() + 1.0, center.y),
+                ],
+                stroke,
+            ));
+            painter.circle_filled(Pos2::new(r.right() - 5.0, r.top() + 5.0), 1.5, color);
         }
     }
 }

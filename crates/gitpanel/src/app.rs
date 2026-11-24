@@ -22,10 +22,10 @@ use gitpanel_metrics::{Granularity, aggregate_local, summary, top_contributors};
 use gitpanel_sync::{SyncEvent, SyncHandle};
 use gitpanel_ui::{
     CommonMarkCache, DataSource, DiffViewState, Icon, Palette, Theme, badge, card, commit_chart,
-    diff_view, empty_state, error_banner, format_bytes, format_date, icon, icon_button,
-    info_banner, install_fonts, kv_row, loading, markdown, muted, outline_badge, page_header,
-    panel_frame, primary_button, relative_time, repo_grid, repo_stats, repo_table, search_input,
-    secondary_button, source_badge, stat_card, tabs,
+    compact_number, diff_view, empty_state, error_banner, format_bytes, format_date, icon,
+    icon_button, info_banner, install_fonts, kv_row, language_color, loading, markdown, muted,
+    outline_badge, page_header, panel_frame, primary_button, relative_time, repo_grid, repo_stats,
+    repo_table, search_input, secondary_button, source_badge, stat_card,
 };
 
 use crate::jobs::Jobs;
@@ -49,38 +49,6 @@ enum RepoTab {
     Actions,
     Charts,
     Diff,
-}
-
-impl RepoTab {
-    fn index(self) -> usize {
-        match self {
-            Self::Overview => 0,
-            Self::Code => 1,
-            Self::Commits => 2,
-            Self::Branches => 3,
-            Self::Releases => 4,
-            Self::Issues => 5,
-            Self::Pulls => 6,
-            Self::Actions => 7,
-            Self::Charts => 8,
-            Self::Diff => 9,
-        }
-    }
-
-    fn from_index(index: usize) -> Self {
-        match index {
-            1 => Self::Code,
-            2 => Self::Commits,
-            3 => Self::Branches,
-            4 => Self::Releases,
-            5 => Self::Issues,
-            6 => Self::Pulls,
-            7 => Self::Actions,
-            8 => Self::Charts,
-            9 => Self::Diff,
-            _ => Self::Overview,
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -268,6 +236,7 @@ pub struct GitPanelApp {
     tree_pending: Option<Receiver<Result<RepoTree, GithubError>>>,
     tree_error: Option<String>,
     code_dir_path: String,
+    code_filter: String,
     readme: Option<ContentPayload>,
     readme_repo: Option<i64>,
     readme_branch: String,
@@ -404,7 +373,7 @@ impl GitPanelApp {
             screen: Screen::Repositories,
             scroll_generation: 0,
             selected_repo_id: None,
-            repo_tab: RepoTab::Overview,
+            repo_tab: RepoTab::Code,
             repo_search: String::new(),
             repo_filter: RepoFilter::All,
             repo_view: RepoView::Grid,
@@ -431,6 +400,7 @@ impl GitPanelApp {
             tree_pending: None,
             tree_error: None,
             code_dir_path: String::new(),
+            code_filter: String::new(),
             readme: None,
             readme_repo: None,
             readme_branch: String::new(),
@@ -602,6 +572,10 @@ impl GitPanelApp {
             #[cfg(debug_assertions)]
             if let Ok(dir) = std::env::var("GITPANEL_OPEN_DIR") {
                 app.code_dir_path = dir;
+            }
+            #[cfg(debug_assertions)]
+            if let Ok(filter) = std::env::var("GITPANEL_OPEN_FILTER") {
+                app.code_filter = filter;
             }
             #[cfg(debug_assertions)]
             if let Ok(path) = std::env::var("GITPANEL_OPEN_PATH") {
@@ -1543,7 +1517,7 @@ impl GitPanelApp {
         self.selected_repo_id = Some(repo_id);
         self.screen = Screen::Repository;
         self.scroll_generation = self.scroll_generation.wrapping_add(1);
-        self.repo_tab = RepoTab::Overview;
+        self.repo_tab = RepoTab::Code;
         self.repo_search.clear();
         self.commits.clear();
         self.commits_total = 0;
@@ -1565,6 +1539,7 @@ impl GitPanelApp {
         self.tree_pending = None;
         self.tree_error = None;
         self.code_dir_path.clear();
+        self.code_filter.clear();
         self.readme = None;
         self.readme_repo = None;
         self.readme_branch.clear();
@@ -1831,6 +1806,7 @@ impl GitPanelApp {
         self.tree_pending = None;
         self.tree_error = None;
         self.code_dir_path.clear();
+        self.code_filter.clear();
         self.readme = None;
         self.readme_repo = None;
         self.readme_branch.clear();
@@ -1961,6 +1937,7 @@ impl GitPanelApp {
         if !same_branch {
             self.tree = None;
             self.code_dir_path.clear();
+            self.code_filter.clear();
             self.code_file = None;
             self.code_file_path = None;
             self.file_pending = None;
@@ -3018,9 +2995,17 @@ impl GitPanelApp {
                 }
             });
         });
-        ui.add_space(8.0);
+        ui.add_space(6.0);
         ui.horizontal(|ui| {
-            icon(ui, Icon::Repo, 24.0, palette.fg_muted);
+            if let Some(texture) = self.avatars.get(&repository.owner) {
+                ui.add(
+                    egui::Image::from_texture(texture)
+                        .fit_to_exact_size(egui::Vec2::splat(24.0))
+                        .corner_radius(12.0),
+                );
+            } else {
+                icon(ui, Icon::Repo, 24.0, palette.fg_muted);
+            }
             ui.label(
                 RichText::new(&repository.owner)
                     .size(20.0)
@@ -3051,38 +3036,28 @@ impl GitPanelApp {
                     palette.attention_fg,
                 );
             }
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                Frame::NONE
+                    .fill(palette.canvas_subtle)
+                    .stroke(Stroke::new(1.0, palette.border_default))
+                    .corner_radius(egui::CornerRadius::same(6))
+                    .inner_margin(Margin::symmetric(8, 4))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            icon(ui, Icon::Star, 12.0, palette.attention_fg);
+                            ui.label(
+                                RichText::new(compact_number(u64::from(repository.stars)))
+                                    .size(11.5)
+                                    .color(palette.fg_muted),
+                            );
+                        });
+                    })
+                    .response
+                    .on_hover_text(self.translator.text(keys::COMMON_STARS));
+            });
         });
-        if let Some(description) = &repository.description {
-            ui.label(
-                RichText::new(description)
-                    .size(13.0)
-                    .color(palette.fg_muted),
-            );
-        } else {
-            ui.label(
-                RichText::new(self.translator.text(keys::REPOS_DETAIL_NO_DESCRIPTION))
-                    .size(13.0)
-                    .color(palette.fg_subtle),
-            );
-        }
-        ui.add_space(10.0);
-
-        let tab_labels = [
-            self.translator.text(keys::TAB_OVERVIEW),
-            self.translator.text(keys::TAB_CODE),
-            self.translator.text(keys::TAB_COMMITS),
-            self.translator.text(keys::TAB_BRANCHES),
-            self.translator.text(keys::TAB_RELEASES),
-            self.translator.text(keys::TAB_ISSUES),
-            self.translator.text(keys::TAB_PULLS),
-            self.translator.text(keys::TAB_ACTIONS),
-            self.translator.text(keys::TAB_CHARTS),
-            self.translator.text(keys::TAB_DIFF),
-        ];
-        let tab_refs: Vec<&str> = tab_labels.iter().map(String::as_str).collect();
-        let mut selected = self.repo_tab.index();
-        if tabs(ui, &tab_refs, &mut selected, palette) {
-            let tab = RepoTab::from_index(selected);
+        ui.add_space(8.0);
+        if let Some(tab) = self.repo_nav(ui, palette) {
             self.repo_tab = tab;
             match tab {
                 RepoTab::Code => self.ensure_code(&repository),
@@ -3108,6 +3083,7 @@ impl GitPanelApp {
                 RepoTab::Overview => {}
             }
         }
+        ui.add_space(10.0);
 
         match self.repo_tab {
             RepoTab::Overview => self.overview_panel(ui, &repository),
@@ -3132,6 +3108,109 @@ impl GitPanelApp {
         if sync_repo {
             self.sync_repository(repository.github_id);
         }
+    }
+
+    fn repo_nav(&self, ui: &mut Ui, palette: Palette) -> Option<RepoTab> {
+        let tabs = [
+            (
+                RepoTab::Code,
+                Icon::Code,
+                self.translator.text(keys::TAB_CODE),
+            ),
+            (
+                RepoTab::Issues,
+                Icon::Issue,
+                self.translator.text(keys::TAB_ISSUES),
+            ),
+            (
+                RepoTab::Pulls,
+                Icon::Pull,
+                self.translator.text(keys::TAB_PULLS),
+            ),
+            (
+                RepoTab::Actions,
+                Icon::Play,
+                self.translator.text(keys::TAB_ACTIONS),
+            ),
+            (
+                RepoTab::Commits,
+                Icon::Commit,
+                self.translator.text(keys::TAB_COMMITS),
+            ),
+            (
+                RepoTab::Branches,
+                Icon::Branch,
+                self.translator.text(keys::TAB_BRANCHES),
+            ),
+            (
+                RepoTab::Releases,
+                Icon::Tag,
+                self.translator.text(keys::TAB_RELEASES),
+            ),
+            (
+                RepoTab::Charts,
+                Icon::Chart,
+                self.translator.text(keys::TAB_CHARTS),
+            ),
+            (
+                RepoTab::Diff,
+                Icon::Diff,
+                self.translator.text(keys::TAB_DIFF),
+            ),
+            (
+                RepoTab::Overview,
+                Icon::Repo,
+                self.translator.text(keys::TAB_OVERVIEW),
+            ),
+        ];
+        let active_underline = Color32::from_rgb(247, 129, 102);
+        let mut selected = None;
+        let nav = ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(2.0, 0.0);
+            for (tab, icon_kind, label) in tabs {
+                let is_selected = tab == self.repo_tab;
+                let color = if is_selected {
+                    palette.fg_default
+                } else {
+                    palette.fg_muted
+                };
+                let response = Frame::NONE
+                    .inner_margin(Margin::symmetric(9, 9))
+                    .corner_radius(egui::CornerRadius::same(6))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            icon(ui, icon_kind, 13.0, color);
+                            ui.label(RichText::new(&label).size(12.0).color(color));
+                        });
+                    })
+                    .response
+                    .interact(egui::Sense::click());
+                if response.hovered() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                }
+                if is_selected {
+                    ui.painter().line_segment(
+                        [
+                            egui::pos2(response.rect.left(), response.rect.bottom() - 1.0),
+                            egui::pos2(response.rect.right(), response.rect.bottom() - 1.0),
+                        ],
+                        Stroke::new(2.0, active_underline),
+                    );
+                }
+                if response.clicked() {
+                    selected = Some(tab);
+                }
+            }
+        });
+        let rect = nav.response.rect;
+        ui.painter().line_segment(
+            [
+                egui::pos2(rect.left(), rect.bottom()),
+                egui::pos2(rect.right(), rect.bottom()),
+            ],
+            Stroke::new(1.0, palette.border_default),
+        );
+        selected
     }
 
     fn branch_combo(&mut self, ui: &mut Ui, repository: &Repository) -> bool {
@@ -3170,29 +3249,72 @@ impl GitPanelApp {
     }
 
     fn code_panel(&mut self, ui: &mut Ui, repository: &Repository) {
+        self.ensure_code(repository);
+        self.load_releases(repository, false);
+        let width = ui.available_width();
+        let sidebar_width = (width * 0.32).clamp(260.0, 320.0);
+        let gap = 16.0;
+        let main_width = (width - sidebar_width - gap).max(360.0);
+        ui.horizontal_top(|ui| {
+            ui.vertical(|ui| {
+                ui.set_width(main_width);
+                ui.set_max_width(main_width);
+                self.code_main(ui, repository, main_width);
+            });
+            ui.add_space(gap);
+            ui.vertical(|ui| {
+                ui.set_width(sidebar_width);
+                ui.set_max_width(sidebar_width);
+                self.repo_sidebar(ui, repository);
+            });
+        });
+    }
+
+    fn code_main(&mut self, ui: &mut Ui, repository: &Repository, width: f32) {
+        ui.set_width(width);
+        ui.set_max_width(width);
         let palette = self.theme.palette;
         self.ensure_code(repository);
+        self.ensure_commits(repository);
         let mut refresh = false;
         let mut branch_changed = false;
+        let mut copy_clone_url = false;
+        let search_hint = self.translator.text(keys::CODE_GO_TO_FILE);
+        let clone_label = self.translator.text(keys::CODE_CLONE);
+        let branch_count = if self.branches.is_empty() {
+            None
+        } else {
+            Some(self.translator.text_args(
+                keys::CODE_BRANCHES_COUNT,
+                &[Arg::int("count", self.branches.len() as i64)],
+            ))
+        };
         ui.horizontal_wrapped(|ui| {
-            ui.label(
-                RichText::new(self.translator.text(keys::COMMON_BRANCH))
-                    .size(12.0)
-                    .color(palette.fg_muted),
-            );
+            icon(ui, Icon::Branch, 13.0, palette.fg_muted);
             branch_changed = self.branch_combo(ui, repository);
+            if let Some(branch_count) = branch_count {
+                badge(ui, branch_count, palette.canvas_inset, palette.fg_muted);
+            }
+            search_input(ui, &mut self.code_filter, &search_hint, palette);
             source_badge(ui, self.tree_source, &self.translator, palette);
             if ui
                 .add(secondary_button(
-                    self.translator.text(keys::CODE_REFRESH),
+                    self.translator.text(keys::COMMON_REFRESH),
                     palette,
                 ))
                 .clicked()
             {
                 refresh = true;
             }
+            if ui
+                .add(primary_button(format!("<> {clone_label}"), palette))
+                .clicked()
+            {
+                copy_clone_url = true;
+            }
         });
         if branch_changed {
+            self.code_filter.clear();
             self.ensure_code(repository);
         }
         if let Some(error) = &self.branches_error {
@@ -3206,294 +3328,602 @@ impl GitPanelApp {
                 self.load_file(repository, &branch, &path, true);
             }
         }
+        if copy_clone_url {
+            ui.ctx().copy_text(format!("{}.git", repository.html_url));
+            self.toast(
+                self.translator.text(keys::CODE_CLONE_COPIED),
+                ToastKind::Success,
+            );
+        }
+
+        if let Some(commit) = self.commits.first().cloned() {
+            Frame::NONE
+                .fill(palette.canvas_subtle)
+                .stroke(Stroke::new(1.0, palette.border_default))
+                .corner_radius(egui::CornerRadius::same(6))
+                .inner_margin(Margin::symmetric(10, 7))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        icon(ui, Icon::Commit, 14.0, palette.fg_muted);
+                        ui.label(
+                            RichText::new(commit.author_display())
+                                .size(11.5)
+                                .strong()
+                                .color(palette.fg_default),
+                        );
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(&commit.message)
+                                    .size(11.5)
+                                    .color(palette.fg_muted),
+                            )
+                            .truncate(),
+                        );
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            ui.label(
+                                RichText::new(relative_time(
+                                    &self.translator,
+                                    commit.committed_at,
+                                    Utc::now(),
+                                ))
+                                .size(10.5)
+                                .color(palette.fg_subtle),
+                            );
+                            ui.label(
+                                RichText::new(commit.short_sha())
+                                    .monospace()
+                                    .size(10.5)
+                                    .color(palette.fg_muted),
+                            );
+                        });
+                    });
+                });
+            ui.add_space(8.0);
+        }
 
         ui.add_space(8.0);
         if self.code_file_path.is_some() {
-            self.code_file_view(ui, repository);
+            self.code_file_view(ui, repository, width);
         } else {
-            self.tree_box(ui, repository);
+            self.tree_box(ui, repository, width);
             if self.code_dir_path.is_empty()
+                && self.code_filter.is_empty()
                 && let Some(readme) = self.readme.clone()
             {
-                ui.add_space(12.0);
-                ui.separator();
-                ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new(self.translator.text(keys::CODE_README))
-                            .size(14.0)
-                            .strong()
-                            .color(palette.fg_default),
-                    );
-                    source_badge(ui, self.readme_source, &self.translator, palette);
-                });
-                ui.add_space(4.0);
-                if let Some(content) = &readme.content {
-                    markdown(ui, &mut self.markdown_cache, content);
-                } else if readme.binary {
-                    info_banner(ui, &self.translator.text(keys::CODE_BINARY), palette);
-                } else if readme.truncated {
-                    info_banner(ui, &self.translator.text(keys::CODE_TOO_LARGE), palette);
-                }
+                ui.add_space(10.0);
+                let readme_width = (width - 2.0).max(200.0);
+                let readme_inner = (readme_width - 28.0).max(120.0);
+                Frame::NONE
+                    .fill(palette.canvas_default)
+                    .stroke(Stroke::new(1.0, palette.border_default))
+                    .corner_radius(egui::CornerRadius::same(6))
+                    .show(ui, |ui| {
+                        ui.set_min_width(readme_width);
+                        ui.set_max_width(readme_width);
+                        Frame::NONE
+                            .fill(palette.canvas_subtle)
+                            .inner_margin(Margin::symmetric(12, 8))
+                            .show(ui, |ui| {
+                                ui.set_min_width((readme_width - 24.0).max(120.0));
+                                ui.horizontal(|ui| {
+                                    icon(ui, Icon::File, 15.0, palette.fg_muted);
+                                    ui.label(
+                                        RichText::new(self.translator.text(keys::CODE_README))
+                                            .size(12.5)
+                                            .strong()
+                                            .color(palette.fg_default),
+                                    );
+                                    source_badge(ui, self.readme_source, &self.translator, palette);
+                                });
+                            });
+                        ui.separator();
+                        Frame::NONE.inner_margin(Margin::same(14)).show(ui, |ui| {
+                            ui.set_min_width(readme_inner);
+                            if let Some(content) = &readme.content {
+                                markdown(ui, &mut self.markdown_cache, content);
+                            } else if readme.binary {
+                                info_banner(ui, &self.translator.text(keys::CODE_BINARY), palette);
+                            } else if readme.truncated {
+                                info_banner(
+                                    ui,
+                                    &self.translator.text(keys::CODE_TOO_LARGE),
+                                    palette,
+                                );
+                            }
+                        });
+                    });
             }
         }
     }
 
-    fn tree_box(&mut self, ui: &mut Ui, repository: &Repository) {
+    fn repo_sidebar(&mut self, ui: &mut Ui, repository: &Repository) {
+        let palette = self.theme.palette;
+        let mut open_github = false;
+        let mut show_releases = false;
+        card(ui, palette, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.label(
+                RichText::new(self.translator.text(keys::CODE_ABOUT))
+                    .size(13.5)
+                    .strong()
+                    .color(palette.fg_default),
+            );
+            ui.add_space(4.0);
+            if let Some(description) = &repository.description {
+                ui.label(
+                    RichText::new(description)
+                        .size(12.0)
+                        .color(palette.fg_muted),
+                );
+            } else {
+                ui.label(
+                    RichText::new(self.translator.text(keys::REPOS_DETAIL_NO_DESCRIPTION))
+                        .size(12.0)
+                        .color(palette.fg_subtle),
+                );
+            }
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                icon(ui, Icon::Star, 14.0, palette.attention_fg);
+                ui.label(
+                    RichText::new(compact_number(u64::from(repository.stars)))
+                        .size(12.0)
+                        .color(palette.fg_muted),
+                );
+                ui.label(
+                    RichText::new(self.translator.text(keys::COMMON_STARS))
+                        .size(12.0)
+                        .color(palette.fg_subtle),
+                );
+            });
+            if ui
+                .add(
+                    egui::Button::new(
+                        RichText::new(format!(
+                            "{} ↗",
+                            self.translator.text(keys::COMMON_OPEN_GITHUB)
+                        ))
+                        .size(11.5)
+                        .color(palette.accent_fg),
+                    )
+                    .frame(false),
+                )
+                .clicked()
+            {
+                open_github = true;
+            }
+        });
+        ui.add_space(12.0);
+        card(ui, palette, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.label(
+                RichText::new(self.translator.text(keys::TAB_RELEASES))
+                    .size(13.5)
+                    .strong()
+                    .color(palette.fg_default),
+            );
+            ui.add_space(4.0);
+            if self.releases_pending.is_some() {
+                loading(ui, &self.translator.text(keys::COMMON_LOADING), palette);
+            } else if self.releases_repo == Some(repository.github_id) {
+                if let Some(release) = self.releases.first() {
+                    ui.label(
+                        RichText::new(&release.tag_name)
+                            .size(12.0)
+                            .strong()
+                            .color(palette.accent_fg),
+                    );
+                    let at = release.published_at.unwrap_or(release.created_at);
+                    ui.label(
+                        RichText::new(relative_time(&self.translator, at, Utc::now()))
+                            .size(10.5)
+                            .color(palette.fg_subtle),
+                    );
+                } else {
+                    ui.label(
+                        RichText::new(self.translator.text(keys::CODE_NO_RELEASES))
+                            .size(12.0)
+                            .color(palette.fg_subtle),
+                    );
+                }
+            } else {
+                ui.label(
+                    RichText::new(self.translator.text(keys::CODE_NO_RELEASES))
+                        .size(12.0)
+                        .color(palette.fg_subtle),
+                );
+            }
+            ui.add_space(4.0);
+            if ui
+                .add(
+                    egui::Button::new(
+                        RichText::new(self.translator.text(keys::CODE_VIEW_RELEASES))
+                            .size(11.5)
+                            .color(palette.accent_fg),
+                    )
+                    .frame(false),
+                )
+                .clicked()
+            {
+                show_releases = true;
+            }
+        });
+        ui.add_space(12.0);
+        card(ui, palette, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.label(
+                RichText::new(self.translator.text(keys::CODE_LANGUAGES))
+                    .size(13.5)
+                    .strong()
+                    .color(palette.fg_default),
+            );
+            ui.add_space(6.0);
+            if let Some(language) = &repository.language {
+                let color = language_color(language);
+                let (rect, _) = ui.allocate_exact_size(
+                    egui::vec2(ui.available_width(), 7.0),
+                    egui::Sense::hover(),
+                );
+                ui.painter().rect_filled(rect, 3.5, color);
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    let (dot, _) =
+                        ui.allocate_exact_size(egui::Vec2::splat(8.0), egui::Sense::hover());
+                    ui.painter().circle_filled(dot.center(), 4.0, color);
+                    ui.label(RichText::new(language).size(12.0).color(palette.fg_default));
+                    ui.label(RichText::new("100%").size(10.5).color(palette.fg_subtle));
+                });
+            } else {
+                muted(
+                    ui,
+                    self.translator.text(keys::COMMON_NOT_AVAILABLE),
+                    palette,
+                );
+            }
+        });
+
+        if open_github {
+            ui.ctx()
+                .open_url(egui::OpenUrl::new_tab(repository.html_url.clone()));
+        }
+        if show_releases {
+            self.repo_tab = RepoTab::Releases;
+            self.load_releases(repository, false);
+            self.scroll_generation = self.scroll_generation.wrapping_add(1);
+        }
+    }
+
+    fn tree_box(&mut self, ui: &mut Ui, repository: &Repository, width: f32) {
         let palette = self.theme.palette;
         let current_dir = self.code_dir_path.clone();
+        let query = self.code_filter.trim().to_ascii_lowercase();
+        let searching = !query.is_empty();
         let mut go_root = false;
         let mut go_up = false;
+        let mut clear_filter = false;
         let mut navigate = None;
         let mut open_file = None;
+        let entries = self.tree.as_ref().map(|tree| {
+            if searching {
+                let mut results: Vec<&gitpanel_core::RepoTreeEntry> = tree
+                    .entries
+                    .iter()
+                    .filter(|entry| {
+                        entry.kind == "file" && entry.path.to_ascii_lowercase().contains(&query)
+                    })
+                    .collect();
+                results.sort_by_key(|entry| entry.path.to_ascii_lowercase());
+                results.truncate(80);
+                results
+            } else {
+                dir_entries(tree, &current_dir)
+            }
+        });
+        let truncated = self.tree.as_ref().is_some_and(|tree| tree.truncated);
+
         Frame::NONE
-            .fill(palette.canvas_subtle)
-            .stroke(Stroke::new(2.0, palette.accent_emphasis))
-            .corner_radius(egui::CornerRadius::same(12))
-            .inner_margin(Margin::same(1))
+            .fill(palette.canvas_default)
+            .stroke(Stroke::new(1.0, palette.border_default))
+            .corner_radius(egui::CornerRadius::same(6))
             .show(ui, |ui| {
+                let box_width = width;
+                let inner_width = (box_width - 24.0).max(100.0);
+                ui.set_min_width(box_width);
+                ui.set_max_width(box_width);
+
                 Frame::NONE
-                    .fill(palette.canvas_default)
-                    .corner_radius(egui::CornerRadius::same(11))
-                    .inner_margin(Margin::same(14))
+                    .fill(palette.canvas_subtle)
+                    .inner_margin(Margin::symmetric(12, 6))
                     .show(ui, |ui| {
-                        let box_width = ui.available_width();
-                        ui.set_min_width(box_width);
-                        ui.set_max_width(box_width);
-                        let entries = self
-                            .tree
-                            .as_ref()
-                            .map(|tree| dir_entries(tree, &current_dir));
-                        let files = entries
-                            .as_ref()
-                            .map(|entries| {
-                                entries.iter().filter(|entry| entry.kind == "file").count()
-                            })
-                            .unwrap_or(0);
-                        let dirs = entries
-                            .as_ref()
-                            .map(|entries| {
-                                entries.iter().filter(|entry| entry.kind == "dir").count()
-                            })
-                            .unwrap_or(0);
-                        let truncated = self.tree.as_ref().is_some_and(|tree| tree.truncated);
-
-                        ui.horizontal(|ui| {
-                            icon(ui, Icon::Folder, 20.0, palette.accent_fg);
-                            ui.label(
-                                RichText::new(self.translator.text(keys::CODE_FILES_TITLE))
-                                    .size(16.0)
-                                    .strong()
-                                    .color(palette.fg_default),
-                            );
-                            if entries.is_some() {
-                                badge(
-                                    ui,
-                                    self.translator.text_args(
-                                        keys::CODE_FILES_SUMMARY,
-                                        &[
-                                            Arg::int("files", files as i64),
-                                            Arg::int("dirs", dirs as i64),
-                                        ],
-                                    ),
-                                    palette.canvas_inset,
-                                    palette.fg_muted,
+                        ui.set_min_width(inner_width);
+                        if searching {
+                            ui.horizontal_wrapped(|ui| {
+                                icon(ui, Icon::Search, 13.0, palette.fg_muted);
+                                ui.label(
+                                    RichText::new(format!(
+                                        "{}: {}",
+                                        self.translator.text(keys::CODE_GO_TO_FILE),
+                                        self.code_filter
+                                    ))
+                                    .size(11.5)
+                                    .color(palette.fg_muted),
                                 );
-                            }
-                            if truncated {
-                                badge(
-                                    ui,
-                                    self.translator.text(keys::CODE_TREE_PARTIAL),
-                                    palette.diff_del_bg,
-                                    palette.attention_fg,
-                                );
-                            }
-                            source_badge(ui, self.tree_source, &self.translator, palette);
-                        });
-
-                        ui.add_space(6.0);
-                        ui.horizontal_wrapped(|ui| {
-                            if ui
-                                .add(
-                                    egui::Button::new(
-                                        RichText::new(self.translator.text(keys::CODE_ROOT))
-                                            .size(11.5)
-                                            .color(if current_dir.is_empty() {
-                                                palette.fg_default
-                                            } else {
-                                                palette.accent_fg
-                                            }),
-                                    )
-                                    .frame(false),
-                                )
-                                .clicked()
-                            {
-                                go_root = true;
-                            }
-                            let parts: Vec<&str> = current_dir
-                                .split('/')
-                                .filter(|part| !part.is_empty())
-                                .collect();
-                            let mut accumulated = String::new();
-                            for (index, part) in parts.iter().enumerate() {
-                                ui.label(RichText::new("/").color(palette.fg_subtle));
-                                accumulated.push_str(part);
-                                let is_last = index + 1 == parts.len();
+                                if !entries.as_ref().is_none_or(|entries| entries.is_empty()) {
+                                    badge(
+                                        ui,
+                                        entries
+                                            .as_ref()
+                                            .map(|entries| entries.len().to_string())
+                                            .unwrap_or_default(),
+                                        palette.canvas_inset,
+                                        palette.fg_muted,
+                                    );
+                                }
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    if ui
+                                        .add(
+                                            egui::Button::new(
+                                                RichText::new("✕")
+                                                    .size(11.0)
+                                                    .color(palette.fg_muted),
+                                            )
+                                            .frame(false),
+                                        )
+                                        .on_hover_text(self.translator.text(keys::CODE_CANCEL_EDIT))
+                                        .clicked()
+                                    {
+                                        clear_filter = true;
+                                    }
+                                });
+                            });
+                        } else {
+                            ui.horizontal_wrapped(|ui| {
+                                icon(ui, Icon::Folder, 13.0, palette.fg_muted);
                                 if ui
                                     .add(
-                                        egui::Button::new(RichText::new(*part).size(11.5).color(
-                                            if is_last {
-                                                palette.fg_default
-                                            } else {
-                                                palette.accent_fg
-                                            },
-                                        ))
+                                        egui::Button::new(
+                                            RichText::new(self.translator.text(keys::CODE_ROOT))
+                                                .size(11.5)
+                                                .color(if current_dir.is_empty() {
+                                                    palette.fg_default
+                                                } else {
+                                                    palette.accent_fg
+                                                }),
+                                        )
                                         .frame(false),
                                     )
                                     .clicked()
                                 {
-                                    navigate = Some(accumulated.clone());
+                                    go_root = true;
                                 }
-                                accumulated.push('/');
-                            }
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                if !current_dir.is_empty()
-                                    && ui
+                                let parts: Vec<&str> = current_dir
+                                    .split('/')
+                                    .filter(|part| !part.is_empty())
+                                    .collect();
+                                let mut accumulated = String::new();
+                                for (index, part) in parts.iter().enumerate() {
+                                    ui.label(RichText::new("/").color(palette.fg_subtle));
+                                    accumulated.push_str(part);
+                                    let is_last = index + 1 == parts.len();
+                                    if ui
                                         .add(
                                             egui::Button::new(
-                                                RichText::new(format!(
-                                                    "← {}",
-                                                    self.translator.text(keys::CODE_UP)
-                                                ))
-                                                .size(11.0)
-                                                .color(palette.accent_fg),
+                                                RichText::new(*part).size(11.5).color(if is_last {
+                                                    palette.fg_default
+                                                } else {
+                                                    palette.accent_fg
+                                                }),
                                             )
                                             .frame(false),
                                         )
                                         .clicked()
-                                {
-                                    go_up = true;
+                                    {
+                                        navigate = Some(accumulated.clone());
+                                    }
+                                    accumulated.push('/');
                                 }
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    if !current_dir.is_empty()
+                                        && ui
+                                            .add(
+                                                egui::Button::new(
+                                                    RichText::new(format!(
+                                                        "← {}",
+                                                        self.translator.text(keys::CODE_UP)
+                                                    ))
+                                                    .size(11.0)
+                                                    .color(palette.accent_fg),
+                                                )
+                                                .frame(false),
+                                            )
+                                            .clicked()
+                                    {
+                                        go_up = true;
+                                    }
+                                });
                             });
-                        });
-                        ui.add_space(8.0);
-                        ui.separator();
-                        ui.add_space(4.0);
-
-                        if self.tree_pending.is_some() {
-                            loading(ui, &self.translator.text(keys::CODE_LOADING), palette);
-                        } else if let Some(error) = &self.tree_error {
-                            error_banner(
-                                ui,
-                                &self.translator.text(keys::ERROR_GENERIC),
-                                error,
-                                palette,
-                            );
-                        } else if let Some(entries) = &entries {
-                            if entries.is_empty() {
-                                muted(ui, self.translator.text(keys::CODE_EMPTY), palette);
-                            } else {
-                                for entry in entries {
-                                    let is_dir = entry.kind == "dir";
-                                    let selected = !is_dir
-                                        && self.code_file_path.as_deref()
-                                            == Some(entry.path.as_str());
-                                    let row_width = ui.available_width();
-                                    let response = Frame::NONE
-                                        .fill(if selected {
-                                            palette.selection_bg
-                                        } else {
-                                            Color32::TRANSPARENT
-                                        })
-                                        .corner_radius(egui::CornerRadius::same(5))
-                                        .inner_margin(Margin::symmetric(6, 3))
-                                        .show(ui, |ui| {
-                                            let row_content_width = (row_width - 12.0).max(80.0);
-                                            ui.set_min_width(row_content_width);
-                                            ui.set_max_width(row_content_width);
-                                            ui.horizontal(|ui| {
-                                                icon(
-                                                    ui,
-                                                    if is_dir { Icon::Folder } else { Icon::File },
-                                                    16.0,
-                                                    if is_dir {
-                                                        palette.accent_fg
-                                                    } else {
-                                                        palette.fg_muted
-                                                    },
-                                                );
-                                                let name_width =
-                                                    (row_content_width - 110.0).max(60.0);
-                                                ui.allocate_ui_with_layout(
-                                                    egui::vec2(name_width, 18.0),
-                                                    Layout::left_to_right(Align::Center),
-                                                    |ui| {
-                                                        ui.add(
-                                                            egui::Label::new(
-                                                                RichText::new(&entry.name)
-                                                                    .size(12.0)
-                                                                    .color(if is_dir {
-                                                                        palette.accent_fg
-                                                                    } else if selected {
-                                                                        palette.fg_default
-                                                                    } else {
-                                                                        palette.fg_muted
-                                                                    }),
-                                                            )
-                                                            .truncate(),
-                                                        );
-                                                    },
-                                                );
-                                                ui.with_layout(
-                                                    Layout::right_to_left(Align::Center),
-                                                    |ui| {
-                                                        if is_dir {
-                                                            ui.label(
-                                                                RichText::new("›")
-                                                                    .size(15.0)
-                                                                    .color(palette.fg_subtle),
-                                                            );
-                                                        } else if let Some(size) = entry.size {
-                                                            ui.label(
-                                                                RichText::new(format_bytes(size))
-                                                                    .size(10.5)
-                                                                    .color(palette.fg_subtle),
-                                                            );
-                                                        }
-                                                    },
-                                                );
-                                            });
-                                        })
-                                        .response
-                                        .interact(egui::Sense::click())
-                                        .on_hover_text(&entry.path);
-                                    if response.hovered() {
-                                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                                    }
-                                    if response.clicked() {
-                                        if is_dir {
-                                            navigate = Some(entry.path.clone());
-                                        } else {
-                                            open_file = Some(entry.path.clone());
-                                        }
-                                    }
-                                }
-                            }
-                            if truncated {
-                                ui.add_space(6.0);
-                                info_banner(
-                                    ui,
-                                    &self.translator.text(keys::CODE_TREE_TRUNCATED),
-                                    palette,
-                                );
-                            }
-                        } else {
-                            loading(ui, &self.translator.text(keys::CODE_LOADING), palette);
                         }
                     });
+                ui.separator();
+
+                Frame::NONE
+                    .fill(palette.canvas_subtle)
+                    .inner_margin(Margin::symmetric(12, 5))
+                    .show(ui, |ui| {
+                        ui.set_min_width(inner_width);
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new(self.translator.text(keys::CODE_FILES_NAME))
+                                    .size(11.0)
+                                    .strong()
+                                    .color(palette.fg_muted),
+                            );
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                ui.label(
+                                    RichText::new(self.translator.text(keys::CODE_FILES_SIZE))
+                                        .size(11.0)
+                                        .strong()
+                                        .color(palette.fg_muted),
+                                );
+                            });
+                        });
+                    });
+                ui.separator();
+
+                if self.tree_pending.is_some() {
+                    ui.add_space(10.0);
+                    loading(ui, &self.translator.text(keys::CODE_LOADING), palette);
+                    ui.add_space(10.0);
+                } else if let Some(error) = &self.tree_error {
+                    ui.add_space(10.0);
+                    error_banner(
+                        ui,
+                        &self.translator.text(keys::ERROR_GENERIC),
+                        error,
+                        palette,
+                    );
+                    ui.add_space(10.0);
+                } else if let Some(entries) = &entries {
+                    if !searching && !current_dir.is_empty() {
+                        let row_width = inner_width;
+                        let response = Frame::NONE
+                            .inner_margin(Margin::symmetric(12, 7))
+                            .show(ui, |ui| {
+                                ui.set_min_width(row_width);
+                                ui.horizontal(|ui| {
+                                    icon(ui, Icon::Folder, 16.0, palette.fg_muted);
+                                    ui.label(
+                                        RichText::new("..").size(12.0).color(palette.accent_fg),
+                                    );
+                                });
+                            })
+                            .response
+                            .interact(egui::Sense::click());
+                        if response.hovered() {
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                        }
+                        if response.clicked() {
+                            go_up = true;
+                        }
+                        ui.separator();
+                    }
+                    if entries.is_empty() {
+                        ui.add_space(8.0);
+                        muted(
+                            ui,
+                            if searching {
+                                self.translator.text(keys::CODE_GO_TO_FILE_EMPTY)
+                            } else {
+                                self.translator.text(keys::CODE_EMPTY)
+                            },
+                            palette,
+                        );
+                        ui.add_space(8.0);
+                    } else {
+                        for entry in entries {
+                            let is_dir = entry.kind == "dir";
+                            let selected = !is_dir
+                                && self.code_file_path.as_deref() == Some(entry.path.as_str());
+                            let row_width = inner_width;
+                            let response = Frame::NONE
+                                .fill(if selected {
+                                    palette.selection_bg
+                                } else {
+                                    Color32::TRANSPARENT
+                                })
+                                .inner_margin(Margin::symmetric(12, 7))
+                                .show(ui, |ui| {
+                                    ui.set_min_width(row_width);
+                                    ui.horizontal(|ui| {
+                                        icon(
+                                            ui,
+                                            if is_dir { Icon::Folder } else { Icon::File },
+                                            16.0,
+                                            if is_dir {
+                                                palette.fg_muted
+                                            } else {
+                                                palette.fg_subtle
+                                            },
+                                        );
+                                        let name_width = (row_width - 140.0).max(80.0);
+                                        ui.allocate_ui_with_layout(
+                                            egui::vec2(name_width, 18.0),
+                                            Layout::left_to_right(Align::Center),
+                                            |ui| {
+                                                let label = if searching {
+                                                    &entry.path
+                                                } else {
+                                                    &entry.name
+                                                };
+                                                ui.add(
+                                                    egui::Label::new(
+                                                        RichText::new(label).size(12.0).color(
+                                                            if is_dir {
+                                                                palette.accent_fg
+                                                            } else {
+                                                                palette.fg_default
+                                                            },
+                                                        ),
+                                                    )
+                                                    .truncate(),
+                                                );
+                                            },
+                                        );
+                                        ui.with_layout(
+                                            Layout::right_to_left(Align::Center),
+                                            |ui| {
+                                                if is_dir {
+                                                    ui.label(
+                                                        RichText::new("›")
+                                                            .size(15.0)
+                                                            .color(palette.fg_subtle),
+                                                    );
+                                                } else if let Some(size) = entry.size {
+                                                    ui.label(
+                                                        RichText::new(format_bytes(size))
+                                                            .size(10.5)
+                                                            .color(palette.fg_subtle),
+                                                    );
+                                                }
+                                            },
+                                        );
+                                    });
+                                })
+                                .response
+                                .interact(egui::Sense::click())
+                                .on_hover_text(&entry.path);
+                            if response.hovered() {
+                                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                            }
+                            if response.clicked() {
+                                if is_dir {
+                                    navigate = Some(entry.path.clone());
+                                } else {
+                                    open_file = Some(entry.path.clone());
+                                }
+                            }
+                            ui.separator();
+                        }
+                    }
+                    if truncated {
+                        ui.add_space(6.0);
+                        info_banner(
+                            ui,
+                            &self.translator.text(keys::CODE_TREE_TRUNCATED),
+                            palette,
+                        );
+                        ui.add_space(6.0);
+                    }
+                } else {
+                    ui.add_space(10.0);
+                    loading(ui, &self.translator.text(keys::CODE_LOADING), palette);
+                    ui.add_space(10.0);
+                }
             });
 
         if go_root {
             self.code_dir_path.clear();
+            self.code_filter.clear();
             self.close_code_file();
         }
         if go_up {
@@ -3501,12 +3931,17 @@ impl GitPanelApp {
                 .rsplit_once('/')
                 .map(|(parent, _)| parent.to_owned())
                 .unwrap_or_default();
+            self.code_filter.clear();
             self.close_code_file();
+        }
+        if clear_filter {
+            self.code_filter.clear();
         }
         if let Some(path) = navigate
             && path != current_dir
         {
             self.code_dir_path = path;
+            self.code_filter.clear();
             self.close_code_file();
         }
         if let Some(path) = open_file {
@@ -3514,6 +3949,7 @@ impl GitPanelApp {
                 .rsplit_once('/')
                 .map(|(parent, _)| parent.to_owned())
                 .unwrap_or_default();
+            self.code_filter.clear();
             self.close_code_file();
             self.load_file(repository, &self.selected_branch.clone(), &path, false);
         }
@@ -3533,7 +3969,7 @@ impl GitPanelApp {
         self.code_save_error = None;
     }
 
-    fn code_file_view(&mut self, ui: &mut Ui, repository: &Repository) {
+    fn code_file_view(&mut self, ui: &mut Ui, repository: &Repository, width: f32) {
         let Some(path) = self.code_file_path.clone() else {
             return;
         };
@@ -3567,227 +4003,208 @@ impl GitPanelApp {
         let mut cancel = false;
         let mut save = false;
 
-        ui.add_space(12.0);
+        ui.add_space(8.0);
         Frame::NONE
-            .fill(palette.canvas_subtle)
-            .stroke(Stroke::new(2.0, palette.accent_emphasis))
-            .corner_radius(egui::CornerRadius::same(12))
-            .inner_margin(Margin::same(1))
+            .fill(palette.canvas_default)
+            .stroke(Stroke::new(1.0, palette.border_default))
+            .corner_radius(egui::CornerRadius::same(6))
+            .inner_margin(Margin::same(14))
             .show(ui, |ui| {
-                Frame::NONE
-                    .fill(palette.canvas_default)
-                    .corner_radius(egui::CornerRadius::same(11))
-                    .inner_margin(Margin::same(14))
-                    .show(ui, |ui| {
-                        let box_width = ui.available_width();
-                        ui.set_min_width(box_width);
-                        ui.set_max_width(box_width);
-                        ui.horizontal_wrapped(|ui| {
-                            if ui
+                let box_width = (width - 30.0).max(200.0);
+                ui.set_min_width(box_width);
+                ui.set_max_width(box_width);
+                ui.horizontal_wrapped(|ui| {
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                RichText::new(format!("← {}", translator.text(keys::COMMON_BACK)))
+                                    .size(11.0)
+                                    .color(palette.accent_fg),
+                            )
+                            .frame(false),
+                        )
+                        .clicked()
+                    {
+                        close = true;
+                    }
+                    icon(ui, Icon::File, 17.0, palette.accent_fg);
+                    ui.label(
+                        RichText::new(&path)
+                            .monospace()
+                            .size(12.5)
+                            .strong()
+                            .color(palette.fg_default),
+                    );
+                    source_badge(ui, file_source, translator, palette);
+                    badge(
+                        ui,
+                        translator.text(if editing {
+                            keys::CODE_EDITING_MODE
+                        } else {
+                            keys::CODE_READ_ONLY
+                        }),
+                        if editing {
+                            palette.selection_bg
+                        } else {
+                            palette.canvas_inset
+                        },
+                        if editing {
+                            palette.accent_fg
+                        } else {
+                            palette.fg_muted
+                        },
+                    );
+                    if let Some(file) = file {
+                        if let Some(size) = file.size {
+                            ui.label(
+                                RichText::new(format_bytes(size))
+                                    .size(10.5)
+                                    .color(palette.fg_subtle),
+                            );
+                        }
+                        if let Some(url) = &file.html_url
+                            && ui
                                 .add(
                                     egui::Button::new(
-                                        RichText::new(format!(
-                                            "← {}",
-                                            translator.text(keys::COMMON_BACK)
-                                        ))
-                                        .size(11.0)
-                                        .color(palette.accent_fg),
+                                        RichText::new(translator.text(keys::COMMON_OPEN_GITHUB))
+                                            .size(11.0)
+                                            .color(palette.accent_fg),
                                     )
                                     .frame(false),
                                 )
                                 .clicked()
-                            {
-                                close = true;
-                            }
-                            icon(ui, Icon::File, 17.0, palette.accent_fg);
-                            ui.label(
-                                RichText::new(&path)
-                                    .monospace()
-                                    .size(12.5)
-                                    .strong()
-                                    .color(palette.fg_default),
-                            );
-                            source_badge(ui, file_source, translator, palette);
-                            badge(
-                                ui,
-                                translator.text(if editing {
-                                    keys::CODE_EDITING_MODE
-                                } else {
-                                    keys::CODE_READ_ONLY
-                                }),
-                                if editing {
-                                    palette.selection_bg
-                                } else {
-                                    palette.canvas_inset
-                                },
-                                if editing {
-                                    palette.accent_fg
-                                } else {
-                                    palette.fg_muted
-                                },
-                            );
-                            if let Some(file) = file {
-                                if let Some(size) = file.size {
-                                    ui.label(
-                                        RichText::new(format_bytes(size))
-                                            .size(10.5)
-                                            .color(palette.fg_subtle),
-                                    );
-                                }
-                                if let Some(url) = &file.html_url
-                                    && ui
-                                        .add(
-                                            egui::Button::new(
-                                                RichText::new(
-                                                    translator.text(keys::COMMON_OPEN_GITHUB),
-                                                )
-                                                .size(11.0)
-                                                .color(palette.accent_fg),
-                                            )
-                                            .frame(false),
-                                        )
-                                        .clicked()
-                                {
-                                    ui.ctx().open_url(egui::OpenUrl::new_tab(url.clone()));
-                                }
-                            }
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                if can_edit
-                                    && !editing
-                                    && icon_button(
-                                        ui,
-                                        Icon::Pencil,
-                                        &translator.text(keys::CODE_EDIT),
-                                    )
-                                    .clicked()
-                                {
-                                    start_edit = true;
-                                }
-                                if ui
-                                    .add(
-                                        egui::Button::new(
-                                            RichText::new("✕").size(13.0).color(palette.fg_muted),
-                                        )
-                                        .frame(false),
-                                    )
-                                    .on_hover_text(translator.text(keys::CODE_CLOSE_VIEWER))
-                                    .clicked()
-                                {
-                                    close = true;
-                                }
-                            });
-                        });
-                        ui.add_space(6.0);
-                        ui.separator();
-
-                        if file_pending {
-                            loading(ui, &translator.text(keys::CODE_FILE_LOADING), palette);
-                            return;
+                        {
+                            ui.ctx().open_url(egui::OpenUrl::new_tab(url.clone()));
                         }
-                        if let Some(error) = &file_error {
-                            error_banner(ui, &translator.text(keys::ERROR_GENERIC), error, palette);
-                            return;
+                    }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if can_edit
+                            && !editing
+                            && icon_button(ui, Icon::Pencil, &translator.text(keys::CODE_EDIT))
+                                .clicked()
+                        {
+                            start_edit = true;
                         }
-                        if let Some(error) = &save_error {
-                            error_banner(ui, &translator.text(keys::ERROR_GENERIC), error, palette);
-                        }
-                        let Some(file) = file else {
-                            loading(ui, &translator.text(keys::CODE_FILE_LOADING), palette);
-                            return;
-                        };
-                        if file.binary {
-                            info_banner(ui, &translator.text(keys::CODE_BINARY), palette);
-                            return;
-                        }
-                        if file.truncated {
-                            info_banner(ui, &translator.text(keys::CODE_TOO_LARGE), palette);
-                            return;
-                        }
-                        if editing {
-                            ui.add_space(8.0);
-                            ui.label(
-                                RichText::new(translator.text(keys::CODE_COMMIT_MESSAGE))
-                                    .size(11.5)
-                                    .color(palette.fg_muted),
-                            );
-                            ui.add(
-                                egui::TextEdit::singleline(commit_message)
-                                    .hint_text(translator.text(keys::CODE_COMMIT_PLACEHOLDER))
-                                    .desired_width(f32::INFINITY)
-                                    .font(egui::TextStyle::Monospace),
-                            );
-                            ui.add_space(8.0);
-                            ui.horizontal(|ui| {
-                                if save_pending {
-                                    loading(ui, &translator.text(keys::COMMON_LOADING), palette);
-                                } else {
-                                    if ui
-                                        .add_enabled(
-                                            !commit_message.trim().is_empty(),
-                                            primary_button(
-                                                translator.text(keys::CODE_SAVE_COMMIT),
-                                                palette,
-                                            ),
-                                        )
-                                        .clicked()
-                                    {
-                                        save = true;
-                                    }
-                                    if ui
-                                        .add(secondary_button(
-                                            translator.text(keys::CODE_CANCEL_EDIT),
-                                            palette,
-                                        ))
-                                        .clicked()
-                                    {
-                                        cancel = true;
-                                    }
-                                }
-                            });
-                            ui.add_space(8.0);
-                            ui.separator();
-                            ui.add_space(4.0);
-                            ui.add(
-                                egui::TextEdit::multiline(edit_buffer)
-                                    .id_salt(("code-editor", repository.github_id, path.as_str()))
-                                    .code_editor()
-                                    .desired_width(f32::INFINITY)
-                                    .desired_rows(20),
-                            );
-                        } else if let Some(content) = &file.content {
-                            const PREVIEW_LIMIT: usize = 50_000;
-                            let total = content.chars().count();
-                            let preview = if total > PREVIEW_LIMIT {
-                                content.chars().take(PREVIEW_LIMIT).collect::<String>()
-                            } else {
-                                content.clone()
-                            };
-                            ScrollArea::horizontal()
-                                .id_salt(("code-file", repository.github_id, path.as_str()))
-                                .auto_shrink([false, true])
-                                .show(ui, |ui| {
-                                    ui.add(
-                                        egui::Label::new(
-                                            RichText::new(preview)
-                                                .monospace()
-                                                .size(11.0)
-                                                .color(palette.fg_default),
-                                        )
-                                        .wrap_mode(egui::TextWrapMode::Extend),
-                                    );
-                                });
-                            if total > PREVIEW_LIMIT {
-                                ui.add_space(6.0);
-                                info_banner(
-                                    ui,
-                                    &translator.text(keys::CODE_VIEW_TRUNCATED),
-                                    palette,
-                                );
-                            }
-                        } else {
-                            muted(ui, translator.text(keys::CODE_EMPTY), palette);
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new("✕").size(13.0).color(palette.fg_muted),
+                                )
+                                .frame(false),
+                            )
+                            .on_hover_text(translator.text(keys::CODE_CLOSE_VIEWER))
+                            .clicked()
+                        {
+                            close = true;
                         }
                     });
+                });
+                ui.add_space(6.0);
+                ui.separator();
+
+                if file_pending {
+                    loading(ui, &translator.text(keys::CODE_FILE_LOADING), palette);
+                    return;
+                }
+                if let Some(error) = &file_error {
+                    error_banner(ui, &translator.text(keys::ERROR_GENERIC), error, palette);
+                    return;
+                }
+                if let Some(error) = &save_error {
+                    error_banner(ui, &translator.text(keys::ERROR_GENERIC), error, palette);
+                }
+                let Some(file) = file else {
+                    loading(ui, &translator.text(keys::CODE_FILE_LOADING), palette);
+                    return;
+                };
+                if file.binary {
+                    info_banner(ui, &translator.text(keys::CODE_BINARY), palette);
+                    return;
+                }
+                if file.truncated {
+                    info_banner(ui, &translator.text(keys::CODE_TOO_LARGE), palette);
+                    return;
+                }
+                if editing {
+                    ui.add_space(8.0);
+                    ui.label(
+                        RichText::new(translator.text(keys::CODE_COMMIT_MESSAGE))
+                            .size(11.5)
+                            .color(palette.fg_muted),
+                    );
+                    ui.add(
+                        egui::TextEdit::singleline(commit_message)
+                            .hint_text(translator.text(keys::CODE_COMMIT_PLACEHOLDER))
+                            .desired_width(f32::INFINITY)
+                            .font(egui::TextStyle::Monospace),
+                    );
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if save_pending {
+                            loading(ui, &translator.text(keys::COMMON_LOADING), palette);
+                        } else {
+                            if ui
+                                .add_enabled(
+                                    !commit_message.trim().is_empty(),
+                                    primary_button(
+                                        translator.text(keys::CODE_SAVE_COMMIT),
+                                        palette,
+                                    ),
+                                )
+                                .clicked()
+                            {
+                                save = true;
+                            }
+                            if ui
+                                .add(secondary_button(
+                                    translator.text(keys::CODE_CANCEL_EDIT),
+                                    palette,
+                                ))
+                                .clicked()
+                            {
+                                cancel = true;
+                            }
+                        }
+                    });
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.add_space(4.0);
+                    ui.add(
+                        egui::TextEdit::multiline(edit_buffer)
+                            .id_salt(("code-editor", repository.github_id, path.as_str()))
+                            .code_editor()
+                            .desired_width(f32::INFINITY)
+                            .desired_rows(20),
+                    );
+                } else if let Some(content) = &file.content {
+                    const PREVIEW_LIMIT: usize = 50_000;
+                    let total = content.chars().count();
+                    let preview = if total > PREVIEW_LIMIT {
+                        content.chars().take(PREVIEW_LIMIT).collect::<String>()
+                    } else {
+                        content.clone()
+                    };
+                    ScrollArea::horizontal()
+                        .id_salt(("code-file", repository.github_id, path.as_str()))
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(preview)
+                                        .monospace()
+                                        .size(11.0)
+                                        .color(palette.fg_default),
+                                )
+                                .wrap_mode(egui::TextWrapMode::Extend),
+                            );
+                        });
+                    if total > PREVIEW_LIMIT {
+                        ui.add_space(6.0);
+                        info_banner(ui, &translator.text(keys::CODE_VIEW_TRUNCATED), palette);
+                    }
+                } else {
+                    muted(ui, translator.text(keys::CODE_EMPTY), palette);
+                }
             });
 
         if close {
