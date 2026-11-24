@@ -179,6 +179,47 @@ pub struct IssueComment {
     pub html_url: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowRun {
+    pub id: i64,
+    pub name: String,
+    pub display_title: Option<String>,
+    pub run_number: u32,
+    pub event: String,
+    pub status: String,
+    pub conclusion: Option<String>,
+    pub head_branch: Option<String>,
+    pub head_sha: String,
+    pub actor: Option<String>,
+    pub html_url: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub run_attempt: Option<u32>,
+    pub workflow_id: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowStep {
+    pub number: u32,
+    pub name: String,
+    pub status: String,
+    pub conclusion: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowJob {
+    pub id: i64,
+    pub run_id: i64,
+    pub name: String,
+    pub status: String,
+    pub conclusion: Option<String>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub completed_at: Option<DateTime<Utc>>,
+    pub html_url: String,
+    pub runner_name: Option<String>,
+    pub steps: Vec<WorkflowStep>,
+}
+
 /// Commit data as delivered by GitHub, before it is associated with a repository.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommitData {

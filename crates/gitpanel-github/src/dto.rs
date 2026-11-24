@@ -206,3 +206,60 @@ pub struct CommentDto {
     pub created_at: DateTime<Utc>,
     pub html_url: Option<String>,
 }
+
+#[derive(Debug, Deserialize)]
+pub struct WorkflowRunsDto {
+    #[serde(default)]
+    pub workflow_runs: Vec<WorkflowRunDto>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct WorkflowRunDto {
+    pub id: i64,
+    pub name: String,
+    pub display_title: Option<String>,
+    #[serde(default)]
+    pub run_number: u32,
+    pub event: String,
+    pub status: String,
+    pub conclusion: Option<String>,
+    pub head_branch: Option<String>,
+    pub head_sha: String,
+    pub actor: Option<LoginDto>,
+    pub html_url: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub run_attempt: Option<u32>,
+    #[serde(default)]
+    pub workflow_id: i64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct WorkflowJobsDto {
+    #[serde(default)]
+    pub jobs: Vec<WorkflowJobDto>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct WorkflowJobDto {
+    pub id: i64,
+    pub run_id: i64,
+    pub name: String,
+    pub status: String,
+    pub conclusion: Option<String>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub completed_at: Option<DateTime<Utc>>,
+    pub html_url: String,
+    pub runner_name: Option<String>,
+    #[serde(default)]
+    pub steps: Vec<WorkflowStepDto>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct WorkflowStepDto {
+    #[serde(default)]
+    pub number: u32,
+    pub name: String,
+    pub status: String,
+    pub conclusion: Option<String>,
+}

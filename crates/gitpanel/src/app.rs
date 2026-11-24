@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
@@ -10,8 +11,8 @@ use egui::{
 use gitpanel_config::{Config, ThemePreference};
 use gitpanel_core::{
     Account, Branch, Commit, CommitData, ContentPayload, CreateRepoRequest, FilePatch, Issue,
-    IssueComment, Label, PullRequest, RateLimit, Release, Repository, ValidationError,
-    validate_description, validate_repo_name,
+    IssueComment, Label, PullRequest, RateLimit, Release, Repository, ValidationError, WorkflowJob,
+    WorkflowRun, validate_description, validate_repo_name,
 };
 use gitpanel_db::Db;
 use gitpanel_diff::{Diff, Highlighter};
@@ -45,6 +46,7 @@ enum RepoTab {
     Releases,
     Issues,
     Pulls,
+    Actions,
     Charts,
     Diff,
 }
@@ -59,8 +61,9 @@ impl RepoTab {
             Self::Releases => 4,
             Self::Issues => 5,
             Self::Pulls => 6,
-            Self::Charts => 7,
-            Self::Diff => 8,
+            Self::Actions => 7,
+            Self::Charts => 8,
+            Self::Diff => 9,
         }
     }
 
@@ -72,8 +75,9 @@ impl RepoTab {
             4 => Self::Releases,
             5 => Self::Issues,
             6 => Self::Pulls,
-            7 => Self::Charts,
-            8 => Self::Diff,
+            7 => Self::Actions,
+            8 => Self::Charts,
+            9 => Self::Diff,
             _ => Self::Overview,
         }
     }
@@ -303,6 +307,22 @@ pub struct GitPanelApp {
     pull_files_error: Option<String>,
     pull_diff: Option<Diff>,
     pull_diff_state: DiffViewState,
+    actions_filter: String,
+    actions_runs: Vec<WorkflowRun>,
+    actions_repo: Option<i64>,
+    actions_source: DataSource,
+    actions_pending: Option<Receiver<Result<Vec<WorkflowRun>, GithubError>>>,
+    actions_error: Option<String>,
+    selected_run: Option<WorkflowRun>,
+    action_jobs: Vec<WorkflowJob>,
+    action_jobs_source: DataSource,
+    action_jobs_pending: Option<Receiver<Result<Vec<WorkflowJob>, GithubError>>>,
+    action_jobs_error: Option<String>,
+    action_logs: HashMap<i64, String>,
+    action_log_job: Option<i64>,
+    action_log_source: DataSource,
+    action_log_pending: Option<Receiver<Result<(i64, String), GithubError>>>,
+    action_log_error: Option<String>,
     markdown_cache: CommonMarkCache,
     diff_source: DiffSource,
     diff_state: DiffViewState,
@@ -439,6 +459,22 @@ impl GitPanelApp {
             pull_files_error: None,
             pull_diff: None,
             pull_diff_state: DiffViewState::default(),
+            actions_filter: "all".to_owned(),
+            actions_runs: Vec::new(),
+            actions_repo: None,
+            actions_source: DataSource::Remote,
+            actions_pending: None,
+            actions_error: None,
+            selected_run: None,
+            action_jobs: Vec::new(),
+            action_jobs_source: DataSource::Remote,
+            action_jobs_pending: None,
+            action_jobs_error: None,
+            action_logs: HashMap::new(),
+            action_log_job: None,
+            action_log_source: DataSource::Remote,
+            action_log_pending: None,
+            action_log_error: None,
             markdown_cache: CommonMarkCache::default(),
             diff_source: DiffSource::Commit,
             diff_state: DiffViewState::default(),
@@ -500,6 +536,10 @@ impl GitPanelApp {
                 Ok("pulls") => {
                     app.repo_tab = RepoTab::Pulls;
                     app.load_pulls(&repository, &app.pulls_state.clone(), false);
+                }
+                Ok("actions") => {
+                    app.repo_tab = RepoTab::Actions;
+                    app.load_actions(&repository, false);
                 }
                 Ok("charts") => {
                     app.repo_tab = RepoTab::Charts;
@@ -878,6 +918,80 @@ impl GitPanelApp {
                 Err(TryRecvError::Disconnected) => {
                     self.pull_files_source = DataSource::Remote;
                     self.pull_files_pending = None;
+                }
+            }
+        }
+
+        if let Some(receiver) = self.actions_pending.take() {
+            match receiver.try_recv() {
+                Ok(Ok(runs)) => {
+                    if let Some(repo_id) = self.actions_repo
+                        && let Ok(payload) = serde_json::to_string(&runs)
+                    {
+                        self.cache_api(repo_id, "actions-runs", "all", &payload);
+                    }
+                    self.actions_runs = runs;
+                    self.actions_source = DataSource::Local;
+                    self.actions_error = None;
+                    self.actions_pending = None;
+                }
+                Ok(Err(error)) => {
+                    self.actions_source = DataSource::Remote;
+                    self.actions_error = Some(self.github_error_title(&error));
+                    self.actions_pending = None;
+                }
+                Err(TryRecvError::Empty) => self.actions_pending = Some(receiver),
+                Err(TryRecvError::Disconnected) => {
+                    self.actions_source = DataSource::Remote;
+                    self.actions_pending = None;
+                }
+            }
+        }
+
+        if let Some(receiver) = self.action_jobs_pending.take() {
+            match receiver.try_recv() {
+                Ok(Ok(jobs)) => {
+                    if let (Some(repo_id), Some(run)) =
+                        (self.selected_repo_id, self.selected_run.as_ref())
+                        && let Ok(payload) = serde_json::to_string(&jobs)
+                    {
+                        self.cache_api(repo_id, "actions-jobs", &run.id.to_string(), &payload);
+                    }
+                    self.action_jobs = jobs;
+                    self.action_jobs_source = DataSource::Local;
+                    self.action_jobs_error = None;
+                    self.action_jobs_pending = None;
+                }
+                Ok(Err(error)) => {
+                    self.action_jobs_source = DataSource::Remote;
+                    self.action_jobs_error = Some(self.github_error_title(&error));
+                    self.action_jobs_pending = None;
+                }
+                Err(TryRecvError::Empty) => self.action_jobs_pending = Some(receiver),
+                Err(TryRecvError::Disconnected) => {
+                    self.action_jobs_source = DataSource::Remote;
+                    self.action_jobs_pending = None;
+                }
+            }
+        }
+
+        if let Some(receiver) = self.action_log_pending.take() {
+            match receiver.try_recv() {
+                Ok(Ok((job_id, log))) => {
+                    self.action_logs.insert(job_id, log);
+                    self.action_log_source = DataSource::Local;
+                    self.action_log_error = None;
+                    self.action_log_pending = None;
+                }
+                Ok(Err(error)) => {
+                    self.action_log_source = DataSource::Remote;
+                    self.action_log_error = Some(self.github_error_title(&error));
+                    self.action_log_pending = None;
+                }
+                Err(TryRecvError::Empty) => self.action_log_pending = Some(receiver),
+                Err(TryRecvError::Disconnected) => {
+                    self.action_log_source = DataSource::Remote;
+                    self.action_log_pending = None;
                 }
             }
         }
@@ -1310,6 +1424,22 @@ impl GitPanelApp {
         self.pull_files_error = None;
         self.pull_diff = None;
         self.pull_diff_state = DiffViewState::default();
+        self.actions_filter = "all".to_owned();
+        self.actions_runs.clear();
+        self.actions_repo = None;
+        self.actions_source = DataSource::Remote;
+        self.actions_pending = None;
+        self.actions_error = None;
+        self.selected_run = None;
+        self.action_jobs.clear();
+        self.action_jobs_source = DataSource::Remote;
+        self.action_jobs_pending = None;
+        self.action_jobs_error = None;
+        self.action_logs.clear();
+        self.action_log_job = None;
+        self.action_log_source = DataSource::Remote;
+        self.action_log_pending = None;
+        self.action_log_error = None;
         self.diff = None;
         self.diff_label.clear();
         self.diff_error = None;
@@ -2042,6 +2172,112 @@ impl GitPanelApp {
         );
     }
 
+    fn load_actions(&mut self, repository: &Repository, refresh: bool) {
+        if self.actions_pending.is_some() {
+            return;
+        }
+        if !refresh && self.actions_repo == Some(repository.github_id) {
+            return;
+        }
+        if !refresh
+            && let Some(cached) = self
+                .db
+                .get_api_cache(repository.github_id, "actions-runs", "all")
+                .ok()
+                .flatten()
+            && let Ok(runs) = serde_json::from_str::<Vec<WorkflowRun>>(&cached)
+        {
+            self.actions_runs = runs;
+            self.actions_repo = Some(repository.github_id);
+            self.actions_source = DataSource::Local;
+            self.actions_error = None;
+            return;
+        }
+        let Some(client) = self.client.clone() else {
+            return;
+        };
+        self.actions_repo = Some(repository.github_id);
+        self.actions_source = DataSource::Loading;
+        self.actions_error = None;
+        let owner = repository.owner.clone();
+        let name = repository.name.clone();
+        self.actions_pending = Some(
+            self.jobs
+                .spawn(async move { client.list_workflow_runs(&owner, &name).await }),
+        );
+    }
+
+    fn select_run(&mut self, repository: &Repository, run: WorkflowRun) {
+        self.selected_run = Some(run.clone());
+        self.action_jobs.clear();
+        self.action_jobs_source = DataSource::Remote;
+        self.action_jobs_pending = None;
+        self.action_jobs_error = None;
+        self.action_logs.clear();
+        self.action_log_job = None;
+        self.action_log_source = DataSource::Remote;
+        self.action_log_pending = None;
+        self.action_log_error = None;
+        self.load_run_jobs(repository, &run, false);
+    }
+
+    fn load_run_jobs(&mut self, repository: &Repository, run: &WorkflowRun, refresh: bool) {
+        if self.action_jobs_pending.is_some() {
+            return;
+        }
+        if !refresh
+            && let Some(cached) = self
+                .db
+                .get_api_cache(repository.github_id, "actions-jobs", &run.id.to_string())
+                .ok()
+                .flatten()
+            && let Ok(jobs) = serde_json::from_str::<Vec<WorkflowJob>>(&cached)
+        {
+            self.action_jobs = jobs;
+            self.action_jobs_source = DataSource::Local;
+            self.action_jobs_error = None;
+            return;
+        }
+        let Some(client) = self.client.clone() else {
+            return;
+        };
+        self.action_jobs_source = DataSource::Loading;
+        self.action_jobs_error = None;
+        let owner = repository.owner.clone();
+        let name = repository.name.clone();
+        let run_id = run.id;
+        self.action_jobs_pending = Some(
+            self.jobs
+                .spawn(async move { client.list_workflow_jobs(&owner, &name, run_id).await }),
+        );
+    }
+
+    fn load_job_logs(&mut self, repository: &Repository, job: &WorkflowJob) {
+        self.action_log_job = Some(job.id);
+        if self.action_logs.contains_key(&job.id) {
+            self.action_log_source = DataSource::Local;
+            self.action_log_error = None;
+            return;
+        }
+        if self.action_log_pending.is_some() {
+            return;
+        }
+        let Some(client) = self.client.clone() else {
+            return;
+        };
+        self.action_log_source = DataSource::Loading;
+        self.action_log_error = None;
+        let owner = repository.owner.clone();
+        let name = repository.name.clone();
+        let job_id = job.id;
+        self.action_log_pending = Some(self.jobs.spawn(async move {
+            client
+                .get_job_logs(&owner, &name, job_id)
+                .await
+                .map(|log| (job_id, log))
+        }));
+    }
+
     fn start_diff(&mut self) {
         let Some(repository) = self.selected_repository().cloned() else {
             return;
@@ -2614,6 +2850,7 @@ impl GitPanelApp {
             self.translator.text(keys::TAB_RELEASES),
             self.translator.text(keys::TAB_ISSUES),
             self.translator.text(keys::TAB_PULLS),
+            self.translator.text(keys::TAB_ACTIONS),
             self.translator.text(keys::TAB_CHARTS),
             self.translator.text(keys::TAB_DIFF),
         ];
@@ -2629,6 +2866,7 @@ impl GitPanelApp {
                 RepoTab::Releases => self.load_releases(&repository, false),
                 RepoTab::Issues => self.load_issues(&repository, &self.issues_state.clone(), false),
                 RepoTab::Pulls => self.load_pulls(&repository, &self.pulls_state.clone(), false),
+                RepoTab::Actions => self.load_actions(&repository, false),
                 RepoTab::Charts => {
                     if self.charts.repo_id != Some(repository.github_id) {
                         self.load_charts(repository.github_id);
@@ -2654,6 +2892,7 @@ impl GitPanelApp {
             RepoTab::Releases => self.releases_panel(ui, &repository),
             RepoTab::Issues => self.issues_panel(ui, &repository),
             RepoTab::Pulls => self.pulls_panel(ui, &repository),
+            RepoTab::Actions => self.actions_panel(ui, &repository),
             RepoTab::Charts => self.charts_panel(ui, &repository),
             RepoTab::Diff => self.diff_panel(ui, &repository),
         }
@@ -4015,6 +4254,259 @@ impl GitPanelApp {
         }
     }
 
+    fn actions_panel(&mut self, ui: &mut Ui, repository: &Repository) {
+        let palette = self.theme.palette;
+        self.load_actions(repository, false);
+        let mut filter = self.actions_filter.clone();
+        let mut refresh = false;
+        ui.horizontal_wrapped(|ui| {
+            ui.label(
+                RichText::new(self.translator.text(keys::ACTIONS_TITLE))
+                    .size(15.0)
+                    .strong()
+                    .color(palette.fg_default),
+            );
+            source_badge(ui, self.actions_source, &self.translator, palette);
+            for (value, key) in [
+                ("all", keys::ACTIONS_ALL),
+                ("active", keys::ACTIONS_ACTIVE),
+                ("completed", keys::ACTIONS_COMPLETED),
+            ] {
+                ui.selectable_value(&mut filter, value.to_owned(), self.translator.text(key));
+            }
+            if ui
+                .add(secondary_button(
+                    self.translator.text(keys::ACTIONS_REFRESH),
+                    palette,
+                ))
+                .clicked()
+            {
+                refresh = true;
+            }
+        });
+        self.actions_filter = filter;
+        if refresh {
+            self.load_actions(repository, true);
+        }
+        if let Some(error) = &self.actions_error {
+            error_banner(
+                ui,
+                &self.translator.text(keys::ERROR_GENERIC),
+                error,
+                palette,
+            );
+        }
+        if self.actions_source == DataSource::Loading {
+            loading(ui, &self.translator.text(keys::COMMON_LOADING), palette);
+        }
+        let runs: Vec<WorkflowRun> = self
+            .actions_runs
+            .iter()
+            .filter(|run| match self.actions_filter.as_str() {
+                "active" => run.status != "completed",
+                "completed" => run.status == "completed",
+                _ => true,
+            })
+            .cloned()
+            .collect();
+        if runs.is_empty() {
+            if self.actions_source != DataSource::Loading {
+                empty_state(
+                    ui,
+                    &self.translator.text(keys::ACTIONS_EMPTY),
+                    "",
+                    palette,
+                    Some(Icon::Refresh),
+                );
+            }
+        } else {
+            let mut selected = None;
+            ScrollArea::vertical()
+                .id_salt(("actions-runs", self.actions_filter.clone()))
+                .max_height(280.0)
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    for run in &runs {
+                        if action_run_row(
+                            ui,
+                            run,
+                            &self.translator,
+                            palette,
+                            self.selected_run.as_ref().map(|selected| selected.id),
+                        ) {
+                            selected = Some(run.clone());
+                        }
+                        ui.separator();
+                    }
+                });
+            if let Some(run) = selected {
+                self.select_run(repository, run);
+            }
+        }
+
+        if let Some(run) = self.selected_run.clone() {
+            ui.add_space(12.0);
+            card(ui, palette, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        RichText::new(format!(
+                            "{}  ·  {}",
+                            run.name,
+                            self.translator.text_args(
+                                keys::ACTIONS_RUN,
+                                &[Arg::int("number", i64::from(run.run_number))],
+                            )
+                        ))
+                        .size(15.0)
+                        .strong()
+                        .color(palette.fg_default),
+                    );
+                    action_status_badge(
+                        ui,
+                        &run.status,
+                        run.conclusion.as_deref(),
+                        &self.translator,
+                        palette,
+                    );
+                    source_badge(ui, self.action_jobs_source, &self.translator, palette);
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new(self.translator.text(keys::COMMON_OPEN_GITHUB))
+                                        .size(11.0)
+                                        .color(palette.accent_fg),
+                                )
+                                .frame(false),
+                            )
+                            .clicked()
+                        {
+                            ui.ctx()
+                                .open_url(egui::OpenUrl::new_tab(run.html_url.clone()));
+                        }
+                    });
+                });
+                ui.horizontal_wrapped(|ui| {
+                    if let Some(title) = &run.display_title {
+                        ui.label(RichText::new(title).size(11.5).color(palette.fg_muted));
+                    }
+                    ui.label(
+                        RichText::new(
+                            self.translator
+                                .text_args(keys::ACTIONS_EVENT, &[Arg::str("event", &run.event)]),
+                        )
+                        .size(10.5)
+                        .color(palette.fg_subtle),
+                    );
+                    if let Some(branch) = &run.head_branch {
+                        ui.label(
+                            RichText::new(
+                                self.translator
+                                    .text_args(keys::ACTIONS_BRANCH, &[Arg::str("branch", branch)]),
+                            )
+                            .size(10.5)
+                            .color(palette.fg_subtle),
+                        );
+                    }
+                    ui.label(
+                        RichText::new(run.head_sha.get(..7).unwrap_or(&run.head_sha))
+                            .monospace()
+                            .size(10.5)
+                            .color(palette.fg_subtle),
+                    );
+                    ui.label(
+                        RichText::new(relative_time(&self.translator, run.updated_at, Utc::now()))
+                            .size(10.5)
+                            .color(palette.fg_subtle),
+                    );
+                });
+                ui.add_space(6.0);
+                if self.action_jobs_source == DataSource::Loading {
+                    loading(ui, &self.translator.text(keys::COMMON_LOADING), palette);
+                } else if let Some(error) = &self.action_jobs_error {
+                    error_banner(
+                        ui,
+                        &self.translator.text(keys::ERROR_GENERIC),
+                        error,
+                        palette,
+                    );
+                } else if self.action_jobs.is_empty() {
+                    muted(ui, self.translator.text(keys::ACTIONS_EMPTY), palette);
+                } else {
+                    let jobs = self.action_jobs.clone();
+                    for job in &jobs {
+                        action_job_card(
+                            ui,
+                            job,
+                            &self.translator,
+                            palette,
+                            self.action_logs.contains_key(&job.id),
+                        );
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new(self.translator.text(keys::ACTIONS_LOGS))
+                                        .size(11.0)
+                                        .color(palette.accent_fg),
+                                )
+                                .frame(false),
+                            )
+                            .clicked()
+                        {
+                            self.load_job_logs(repository, job);
+                        }
+                    }
+                }
+
+                ui.add_space(10.0);
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(self.translator.text(keys::ACTIONS_LOGS))
+                            .size(14.0)
+                            .strong()
+                            .color(palette.fg_default),
+                    );
+                    source_badge(ui, self.action_log_source, &self.translator, palette);
+                });
+                if self.action_log_source == DataSource::Loading {
+                    loading(
+                        ui,
+                        &self.translator.text(keys::ACTIONS_LOADING_LOGS),
+                        palette,
+                    );
+                } else if let Some(error) = &self.action_log_error {
+                    error_banner(
+                        ui,
+                        &self.translator.text(keys::ERROR_GENERIC),
+                        error,
+                        palette,
+                    );
+                } else if let Some(job_id) = self.action_log_job
+                    && let Some(log) = self.action_logs.get(&job_id)
+                {
+                    ScrollArea::both()
+                        .id_salt(("action-log", job_id))
+                        .max_height(300.0)
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(log)
+                                        .monospace()
+                                        .size(10.5)
+                                        .color(palette.fg_default),
+                                )
+                                .wrap_mode(egui::TextWrapMode::Extend),
+                            );
+                        });
+                } else {
+                    muted(ui, self.translator.text(keys::ACTIONS_NO_LOGS), palette);
+                }
+            });
+        }
+    }
+
     fn charts_panel(&mut self, ui: &mut Ui, repository: &Repository) {
         let palette = self.theme.palette;
         if self.charts.repo_id != Some(repository.github_id) {
@@ -4898,6 +5390,7 @@ impl GitPanelApp {
                 RepoTab::Releases => self.load_releases(&repository, false),
                 RepoTab::Issues => self.load_issues(&repository, &self.issues_state.clone(), false),
                 RepoTab::Pulls => self.load_pulls(&repository, &self.pulls_state.clone(), false),
+                RepoTab::Actions => self.load_actions(&repository, false),
                 RepoTab::Charts => {
                     if self.charts.repo_id != Some(repository.github_id) {
                         self.load_charts(repository.github_id);
@@ -5108,6 +5601,208 @@ impl eframe::App for GitPanelApp {
             || self.branches_pending.is_some();
         ctx.request_repaint_after(Duration::from_millis(if busy { 200 } else { 1000 }));
     }
+}
+
+fn action_status_badge(
+    ui: &mut Ui,
+    status: &str,
+    conclusion: Option<&str>,
+    translator: &Translator,
+    palette: Palette,
+) {
+    let (key, background, foreground) = match (status, conclusion) {
+        ("completed", Some("success")) => (
+            keys::ACTIONS_STATUS_SUCCESS,
+            palette.diff_add_bg,
+            palette.success_fg,
+        ),
+        ("completed", Some("failure")) => (
+            keys::ACTIONS_STATUS_FAILURE,
+            palette.diff_del_bg,
+            palette.danger_fg,
+        ),
+        ("completed", Some("cancelled")) => (
+            keys::ACTIONS_STATUS_CANCELLED,
+            palette.canvas_inset,
+            palette.fg_muted,
+        ),
+        ("completed", Some("skipped")) => (
+            keys::ACTIONS_STATUS_SKIPPED,
+            palette.canvas_inset,
+            palette.fg_muted,
+        ),
+        ("completed", Some("timed_out")) => (
+            keys::ACTIONS_STATUS_TIMED_OUT,
+            palette.diff_del_bg,
+            palette.danger_fg,
+        ),
+        ("completed", Some("action_required")) => (
+            keys::ACTIONS_STATUS_ACTION_REQUIRED,
+            palette.canvas_inset,
+            palette.attention_fg,
+        ),
+        ("completed", Some("neutral")) => (
+            keys::ACTIONS_STATUS_NEUTRAL,
+            palette.canvas_inset,
+            palette.fg_muted,
+        ),
+        ("completed", Some("stale")) => (
+            keys::ACTIONS_STATUS_STALE,
+            palette.canvas_inset,
+            palette.fg_muted,
+        ),
+        ("completed", _) => (
+            keys::ACTIONS_STATUS_COMPLETED,
+            palette.canvas_inset,
+            palette.fg_muted,
+        ),
+        ("in_progress", _) => (
+            keys::ACTIONS_STATUS_IN_PROGRESS,
+            palette.selection_bg,
+            palette.accent_fg,
+        ),
+        ("queued", _) | ("requested", _) | ("waiting", _) | ("pending", _) => (
+            keys::ACTIONS_STATUS_QUEUED,
+            palette.canvas_inset,
+            palette.attention_fg,
+        ),
+        _ => (
+            keys::ACTIONS_STATUS_UNKNOWN,
+            palette.canvas_inset,
+            palette.fg_muted,
+        ),
+    };
+    badge(ui, translator.text(key), background, foreground);
+}
+
+fn action_run_row(
+    ui: &mut Ui,
+    run: &WorkflowRun,
+    translator: &Translator,
+    palette: Palette,
+    selected: Option<i64>,
+) -> bool {
+    let mut clicked = false;
+    Frame::NONE
+        .fill(if selected == Some(run.id) {
+            palette.selection_bg
+        } else {
+            palette.canvas_default
+        })
+        .inner_margin(Margin::symmetric(6, 7))
+        .show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                action_status_badge(
+                    ui,
+                    &run.status,
+                    run.conclusion.as_deref(),
+                    translator,
+                    palette,
+                );
+                if ui
+                    .add(
+                        egui::Button::new(
+                            RichText::new(&run.name)
+                                .size(12.5)
+                                .strong()
+                                .color(palette.fg_default),
+                        )
+                        .frame(false),
+                    )
+                    .clicked()
+                {
+                    clicked = true;
+                }
+                ui.label(
+                    RichText::new(format!("#{}", run.run_number))
+                        .monospace()
+                        .size(10.5)
+                        .color(palette.fg_subtle),
+                );
+                if let Some(title) = &run.display_title {
+                    ui.label(RichText::new(title).size(10.5).color(palette.fg_muted));
+                }
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.label(
+                        RichText::new(relative_time(translator, run.updated_at, Utc::now()))
+                            .size(10.5)
+                            .color(palette.fg_subtle),
+                    );
+                    if let Some(actor) = &run.actor {
+                        ui.label(RichText::new(actor).size(10.5).color(palette.fg_muted));
+                    }
+                    if let Some(branch) = &run.head_branch {
+                        ui.label(RichText::new(branch).size(10.5).color(palette.fg_subtle));
+                    }
+                    ui.label(
+                        RichText::new(&run.event)
+                            .size(10.5)
+                            .color(palette.fg_subtle),
+                    );
+                });
+            });
+        });
+    clicked
+}
+
+fn action_job_card(
+    ui: &mut Ui,
+    job: &WorkflowJob,
+    translator: &Translator,
+    palette: Palette,
+    has_logs: bool,
+) {
+    card(ui, palette, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            action_status_badge(
+                ui,
+                &job.status,
+                job.conclusion.as_deref(),
+                translator,
+                palette,
+            );
+            ui.label(
+                RichText::new(&job.name)
+                    .size(12.5)
+                    .strong()
+                    .color(palette.fg_default),
+            );
+            if let Some(runner) = &job.runner_name {
+                ui.label(
+                    RichText::new(
+                        translator.text_args(keys::ACTIONS_RUNNER, &[Arg::str("name", runner)]),
+                    )
+                    .size(10.5)
+                    .color(palette.fg_subtle),
+                );
+            }
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if has_logs {
+                    badge(
+                        ui,
+                        translator.text(keys::ACTIONS_LOGS),
+                        palette.diff_add_bg,
+                        palette.success_fg,
+                    );
+                }
+            });
+        });
+        if !job.steps.is_empty() {
+            ui.add_space(4.0);
+            for step in &job.steps {
+                ui.horizontal(|ui| {
+                    let (icon_kind, color) = match step.conclusion.as_deref() {
+                        Some("success") => (Icon::Check, palette.success_fg),
+                        Some("failure") | Some("timed_out") => (Icon::Warning, palette.danger_fg),
+                        Some("skipped") => (Icon::Branch, palette.fg_subtle),
+                        _ => (Icon::Branch, palette.attention_fg),
+                    };
+                    icon(ui, icon_kind, 12.0, color);
+                    ui.label(RichText::new(&step.name).size(10.5).color(palette.fg_muted));
+                });
+            }
+        }
+    });
 }
 
 fn issue_row(ui: &mut Ui, issue: &Issue, translator: &Translator, palette: Palette) -> bool {

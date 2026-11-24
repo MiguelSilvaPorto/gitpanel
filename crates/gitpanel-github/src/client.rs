@@ -7,7 +7,7 @@ use chrono::{DateTime, Utc};
 use gitpanel_core::{
     Account, Branch, CommitData, CommitDiffResult, CompareResult, ContentEntry, ContentPayload,
     CreateRepoRequest, FilePatch, Issue, IssueComment, Label, PullRequest, RateLimit, Release,
-    ReleaseAsset, Repository,
+    ReleaseAsset, Repository, WorkflowJob, WorkflowRun, WorkflowStep,
 };
 use reqwest::header::{ACCEPT, HeaderMap};
 use reqwest::{Client, RequestBuilder, StatusCode, Url};
@@ -16,7 +16,7 @@ use serde_json::{Value, json};
 use crate::auth::Token;
 use crate::dto::{
     BranchDto, CommentDto, CommitDetailDto, CompareDto, FileDto, IssueDto, PullRequestDto,
-    ReleaseDto, RepoDto, UserDto,
+    ReleaseDto, RepoDto, UserDto, WorkflowJobDto, WorkflowJobsDto, WorkflowRunDto, WorkflowRunsDto,
 };
 use crate::error::GithubError;
 
@@ -573,6 +573,97 @@ impl GithubClient {
         Ok(files)
     }
 
+    pub async fn list_workflow_runs(
+        &self,
+        owner: &str,
+        repo: &str,
+    ) -> Result<Vec<WorkflowRun>, GithubError> {
+        let mut runs = Vec::new();
+        let mut page = 1u32;
+        loop {
+            let page_value = page.to_string();
+            let url = Url::parse(&format!(
+                "{}/repos/{owner}/{repo}/actions/runs",
+                self.api_base
+            ))
+            .map_err(|error| GithubError::Decode {
+                context: "workflow runs URL".to_owned(),
+                details: error.to_string(),
+            })?;
+            let request = self
+                .http
+                .get(url)
+                .query(&[("per_page", "100"), ("page", page_value.as_str())]);
+            let (_, _, body) = self.send(request).await?;
+            let page_data: WorkflowRunsDto = decode(&body, "workflow runs")?;
+            let count = page_data.workflow_runs.len();
+            runs.extend(page_data.workflow_runs.into_iter().map(run_from_dto));
+            if count < PER_PAGE || page >= 10 {
+                break;
+            }
+            page += 1;
+        }
+        Ok(runs)
+    }
+
+    pub async fn list_workflow_jobs(
+        &self,
+        owner: &str,
+        repo: &str,
+        run_id: i64,
+    ) -> Result<Vec<WorkflowJob>, GithubError> {
+        let mut jobs = Vec::new();
+        let mut page = 1u32;
+        loop {
+            let page_value = page.to_string();
+            let url = Url::parse(&format!(
+                "{}/repos/{owner}/{repo}/actions/runs/{run_id}/jobs",
+                self.api_base
+            ))
+            .map_err(|error| GithubError::Decode {
+                context: "workflow jobs URL".to_owned(),
+                details: error.to_string(),
+            })?;
+            let request = self.http.get(url).query(&[
+                ("filter", "latest"),
+                ("per_page", "100"),
+                ("page", page_value.as_str()),
+            ]);
+            let (_, _, body) = self.send(request).await?;
+            let page_data: WorkflowJobsDto = decode(&body, "workflow jobs")?;
+            let count = page_data.jobs.len();
+            jobs.extend(page_data.jobs.into_iter().map(job_from_dto));
+            if count < PER_PAGE || page >= 100 {
+                break;
+            }
+            page += 1;
+        }
+        Ok(jobs)
+    }
+
+    pub async fn get_job_logs(
+        &self,
+        owner: &str,
+        repo: &str,
+        job_id: i64,
+    ) -> Result<String, GithubError> {
+        let url = Url::parse(&format!(
+            "{}/repos/{owner}/{repo}/actions/jobs/{job_id}/logs",
+            self.api_base
+        ))
+        .map_err(|error| GithubError::Decode {
+            context: "job logs URL".to_owned(),
+            details: error.to_string(),
+        })?;
+        let (_, _, body) = self.send(self.http.get(url)).await?;
+        let mut text = body;
+        if text.len() > 2_000_000 {
+            text.truncate(2_000_000);
+            text.push_str("\n… log truncado …");
+        }
+        Ok(text)
+    }
+
     fn contents_url(
         &self,
         owner: &str,
@@ -720,6 +811,50 @@ fn comment_from_dto(dto: CommentDto) -> IssueComment {
         user: dto.user.map(|user| user.login),
         created_at: dto.created_at,
         html_url: dto.html_url,
+    }
+}
+
+fn run_from_dto(dto: WorkflowRunDto) -> WorkflowRun {
+    WorkflowRun {
+        id: dto.id,
+        name: dto.name,
+        display_title: dto.display_title,
+        run_number: dto.run_number,
+        event: dto.event,
+        status: dto.status,
+        conclusion: dto.conclusion,
+        head_branch: dto.head_branch,
+        head_sha: dto.head_sha,
+        actor: dto.actor.map(|actor| actor.login),
+        html_url: dto.html_url,
+        created_at: dto.created_at,
+        updated_at: dto.updated_at,
+        run_attempt: dto.run_attempt,
+        workflow_id: dto.workflow_id,
+    }
+}
+
+fn job_from_dto(dto: WorkflowJobDto) -> WorkflowJob {
+    WorkflowJob {
+        id: dto.id,
+        run_id: dto.run_id,
+        name: dto.name,
+        status: dto.status,
+        conclusion: dto.conclusion,
+        started_at: dto.started_at,
+        completed_at: dto.completed_at,
+        html_url: dto.html_url,
+        runner_name: dto.runner_name,
+        steps: dto
+            .steps
+            .into_iter()
+            .map(|step| WorkflowStep {
+                number: step.number,
+                name: step.name,
+                status: step.status,
+                conclusion: step.conclusion,
+            })
+            .collect(),
     }
 }
 
