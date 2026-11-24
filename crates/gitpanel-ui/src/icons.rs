@@ -30,6 +30,7 @@ pub enum Icon {
     Pull,
     Play,
     Tag,
+    Book,
 }
 
 pub fn icon_button(ui: &mut Ui, icon: Icon, tooltip: &str) -> Response {
@@ -486,6 +487,21 @@ pub fn draw(ui: &Ui, icon: Icon, rect: Rect, color: Color32) {
                 stroke,
             ));
             painter.circle_filled(Pos2::new(r.right() - 5.0, r.top() + 5.0), 1.5, color);
+        }
+        Icon::Book => {
+            let left = Pos2::new(r.left() + 1.0, r.top() + 2.0);
+            let right = Pos2::new(r.right() - 1.0, r.top() + 2.0);
+            let bottom_left = Pos2::new(r.left() + 1.0, r.bottom() - 2.0);
+            let bottom_right = Pos2::new(r.right() - 1.0, r.bottom() - 2.0);
+            let spine_top = Pos2::new(center.x, r.top() + 4.0);
+            let spine_bottom = Pos2::new(center.x, r.bottom() - 1.0);
+            painter.line_segment([left, spine_top], stroke);
+            painter.line_segment([spine_top, right], stroke);
+            painter.line_segment([left, bottom_left], stroke);
+            painter.line_segment([bottom_left, spine_bottom], stroke);
+            painter.line_segment([spine_bottom, bottom_right], stroke);
+            painter.line_segment([bottom_right, right], stroke);
+            painter.line_segment([spine_top, spine_bottom], stroke);
         }
     }
 }

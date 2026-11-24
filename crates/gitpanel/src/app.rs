@@ -1165,7 +1165,15 @@ impl GitPanelApp {
                     if let Some(repository) = self.selected_repository().cloned()
                         && let Some(path) = self.code_file_path.clone()
                     {
-                        self.load_file(&repository, &self.selected_branch.clone(), &path, true);
+                        let branch = self.selected_branch.clone();
+                        self.load_file(&repository, &branch, &path, true);
+                        if path
+                            .rsplit('/')
+                            .next()
+                            .is_some_and(|name| name.eq_ignore_ascii_case("README.md"))
+                        {
+                            self.load_readme(&repository, &branch, true);
+                        }
                     }
                 }
                 Ok(Err(error)) => {
@@ -3279,6 +3287,8 @@ impl GitPanelApp {
         let mut refresh = false;
         let mut branch_changed = false;
         let mut copy_clone_url = false;
+        let mut edit_readme = false;
+        let mut open_readme_url = None;
         let search_hint = self.translator.text(keys::CODE_GO_TO_FILE);
         let clone_label = self.translator.text(keys::CODE_CLONE);
         let branch_count = if self.branches.is_empty() {
@@ -3392,8 +3402,12 @@ impl GitPanelApp {
             {
                 ui.add_space(10.0);
                 let readme_width = (width - 2.0).max(200.0);
-                let readme_inner = (readme_width - 28.0).max(120.0);
-                Frame::NONE
+                let readme_inner = (readme_width - 40.0).max(120.0);
+                let can_edit_readme = readme.content.is_some()
+                    && readme.sha.is_some()
+                    && !readme.binary
+                    && !readme.truncated;
+                let readme_response = Frame::NONE
                     .fill(palette.canvas_default)
                     .stroke(Stroke::new(1.0, palette.border_default))
                     .corner_radius(egui::CornerRadius::same(6))
@@ -3402,11 +3416,11 @@ impl GitPanelApp {
                         ui.set_max_width(readme_width);
                         Frame::NONE
                             .fill(palette.canvas_subtle)
-                            .inner_margin(Margin::symmetric(12, 8))
+                            .inner_margin(Margin::symmetric(12, 7))
                             .show(ui, |ui| {
                                 ui.set_min_width((readme_width - 24.0).max(120.0));
                                 ui.horizontal(|ui| {
-                                    icon(ui, Icon::File, 15.0, palette.fg_muted);
+                                    icon(ui, Icon::Book, 15.0, palette.fg_muted);
                                     ui.label(
                                         RichText::new(self.translator.text(keys::CODE_README))
                                             .size(12.5)
@@ -3414,11 +3428,36 @@ impl GitPanelApp {
                                             .color(palette.fg_default),
                                     );
                                     source_badge(ui, self.readme_source, &self.translator, palette);
+                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                        if can_edit_readme
+                                            && icon_button(
+                                                ui,
+                                                Icon::Pencil,
+                                                &self.translator.text(keys::CODE_EDIT),
+                                            )
+                                            .clicked()
+                                        {
+                                            edit_readme = true;
+                                        }
+                                        if let Some(url) = &readme.html_url
+                                            && icon_button(
+                                                ui,
+                                                Icon::External,
+                                                &self.translator.text(keys::COMMON_OPEN_GITHUB),
+                                            )
+                                            .clicked()
+                                        {
+                                            open_readme_url = Some(url.clone());
+                                        }
+                                    });
                                 });
                             });
                         ui.separator();
-                        Frame::NONE.inner_margin(Margin::same(14)).show(ui, |ui| {
+                        Frame::NONE.inner_margin(Margin::same(20)).show(ui, |ui| {
                             ui.set_min_width(readme_inner);
+                            ui.style_mut()
+                                .text_styles
+                                .insert(egui::TextStyle::Body, egui::FontId::proportional(13.0));
                             if let Some(content) = &readme.content {
                                 markdown(ui, &mut self.markdown_cache, content);
                             } else if readme.binary {
@@ -3432,7 +3471,31 @@ impl GitPanelApp {
                             }
                         });
                     });
+                #[cfg(debug_assertions)]
+                if std::env::var_os("GITPANEL_OPEN_README").is_some() {
+                    readme_response.response.scroll_to_me(Some(Align::TOP));
+                }
+                #[cfg(not(debug_assertions))]
+                let _ = &readme_response;
             }
+        }
+
+        if let Some(url) = open_readme_url {
+            ui.ctx().open_url(egui::OpenUrl::new_tab(url));
+        }
+        if edit_readme && let Some(readme) = self.readme.clone() {
+            let path = if readme.path.is_empty() {
+                "README.md".to_owned()
+            } else {
+                readme.path.clone()
+            };
+            self.code_file = Some(readme);
+            self.code_file_path = Some(path);
+            self.file_source = self.readme_source;
+            self.file_pending = None;
+            self.file_error = None;
+            self.scroll_generation = self.scroll_generation.wrapping_add(1);
+            self.begin_edit();
         }
     }
 
