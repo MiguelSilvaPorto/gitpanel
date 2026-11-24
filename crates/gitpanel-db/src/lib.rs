@@ -84,6 +84,15 @@ CREATE TABLE IF NOT EXISTS release_cache (
     fetched_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS api_cache (
+    repo_id INTEGER NOT NULL REFERENCES repos(github_id) ON DELETE CASCADE,
+    kind TEXT NOT NULL,
+    key TEXT NOT NULL,
+    payload TEXT NOT NULL,
+    fetched_at TEXT NOT NULL,
+    PRIMARY KEY (repo_id, kind, key)
+);
+
 CREATE TABLE IF NOT EXISTS sync_runs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     started_at TEXT NOT NULL,
@@ -591,6 +600,43 @@ impl Db {
         Ok(())
     }
 
+    pub fn get_api_cache(
+        &self,
+        repo_id: i64,
+        kind: &str,
+        key: &str,
+    ) -> Result<Option<String>, DbError> {
+        let connection = self.connection()?;
+        connection
+            .query_row(
+                "SELECT payload FROM api_cache
+                 WHERE repo_id = ?1 AND kind = ?2 AND key = ?3",
+                params![repo_id, kind, key],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(DbError::from)
+    }
+
+    pub fn put_api_cache(
+        &self,
+        repo_id: i64,
+        kind: &str,
+        key: &str,
+        payload: &str,
+    ) -> Result<(), DbError> {
+        let connection = self.connection()?;
+        connection.execute(
+            "INSERT INTO api_cache (repo_id, kind, key, payload, fetched_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(repo_id, kind, key) DO UPDATE SET
+                payload = excluded.payload,
+                fetched_at = excluded.fetched_at",
+            params![repo_id, kind, key, payload, Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
     pub fn start_sync_run(&self, at: DateTime<Utc>) -> Result<i64, DbError> {
         let connection = self.connection()?;
         connection.execute(
@@ -826,6 +872,12 @@ mod tests {
         db.put_release_cache(1, "[]").expect("releases");
         assert_eq!(
             db.get_release_cache(1).expect("releases get"),
+            Some("[]".to_owned())
+        );
+        db.put_api_cache(1, "issues", "open", "[]")
+            .expect("api cache");
+        assert_eq!(
+            db.get_api_cache(1, "issues", "open").expect("api get"),
             Some("[]".to_owned())
         );
     }

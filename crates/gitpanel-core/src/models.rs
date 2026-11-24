@@ -125,6 +125,60 @@ pub struct Release {
     pub assets: Vec<ReleaseAsset>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Label {
+    pub name: String,
+    pub color: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Issue {
+    pub number: i64,
+    pub title: String,
+    pub body: Option<String>,
+    pub state: String,
+    pub user: Option<String>,
+    pub labels: Vec<Label>,
+    pub comments: u32,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub closed_at: Option<DateTime<Utc>>,
+    pub html_url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PullRequest {
+    pub number: i64,
+    pub title: String,
+    pub body: Option<String>,
+    pub state: String,
+    pub merged: bool,
+    pub draft: bool,
+    pub user: Option<String>,
+    pub head_ref: String,
+    pub head_sha: String,
+    pub base_ref: String,
+    pub base_sha: String,
+    pub comments: u32,
+    pub commits: u32,
+    pub additions: u32,
+    pub deletions: u32,
+    pub changed_files: u32,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub merged_at: Option<DateTime<Utc>>,
+    pub html_url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IssueComment {
+    pub id: i64,
+    pub body: Option<String>,
+    pub user: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub html_url: Option<String>,
+}
+
 /// Commit data as delivered by GitHub, before it is associated with a repository.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommitData {

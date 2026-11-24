@@ -6,14 +6,18 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use chrono::{DateTime, Utc};
 use gitpanel_core::{
     Account, Branch, CommitData, CommitDiffResult, CompareResult, ContentEntry, ContentPayload,
-    CreateRepoRequest, FilePatch, RateLimit, Release, ReleaseAsset, Repository,
+    CreateRepoRequest, FilePatch, Issue, IssueComment, Label, PullRequest, RateLimit, Release,
+    ReleaseAsset, Repository,
 };
 use reqwest::header::{ACCEPT, HeaderMap};
 use reqwest::{Client, RequestBuilder, StatusCode, Url};
 use serde_json::{Value, json};
 
 use crate::auth::Token;
-use crate::dto::{BranchDto, CommitDetailDto, CompareDto, FileDto, ReleaseDto, RepoDto, UserDto};
+use crate::dto::{
+    BranchDto, CommentDto, CommitDetailDto, CompareDto, FileDto, IssueDto, PullRequestDto,
+    ReleaseDto, RepoDto, UserDto,
+};
 use crate::error::GithubError;
 
 const API_BASE: &str = "https://api.github.com";
@@ -386,6 +390,185 @@ impl GithubClient {
         Ok(releases)
     }
 
+    pub async fn list_issues(
+        &self,
+        owner: &str,
+        repo: &str,
+        state: &str,
+    ) -> Result<Vec<Issue>, GithubError> {
+        let mut issues = Vec::new();
+        let mut page = 1u32;
+        loop {
+            let page_value = page.to_string();
+            let url = Url::parse(&format!("{}/repos/{owner}/{repo}/issues", self.api_base))
+                .map_err(|error| GithubError::Decode {
+                    context: "issues URL".to_owned(),
+                    details: error.to_string(),
+                })?;
+            let request = self.http.get(url).query(&[
+                ("state", state),
+                ("sort", "updated"),
+                ("direction", "desc"),
+                ("per_page", "100"),
+                ("page", page_value.as_str()),
+            ]);
+            let (_, _, body) = self.send(request).await?;
+            let page_items: Vec<IssueDto> = decode(&body, "issues")?;
+            let count = page_items.len();
+            issues.extend(
+                page_items
+                    .into_iter()
+                    .filter(|issue| issue.pull_request.is_none())
+                    .map(issue_from_dto),
+            );
+            if count < PER_PAGE || page >= 100 {
+                break;
+            }
+            page += 1;
+        }
+        Ok(issues)
+    }
+
+    pub async fn get_issue(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: i64,
+    ) -> Result<Issue, GithubError> {
+        let url = Url::parse(&format!(
+            "{}/repos/{owner}/{repo}/issues/{number}",
+            self.api_base
+        ))
+        .map_err(|error| GithubError::Decode {
+            context: "issue URL".to_owned(),
+            details: error.to_string(),
+        })?;
+        let (_, _, body) = self.send(self.http.get(url)).await?;
+        let dto: IssueDto = decode(&body, "issue")?;
+        Ok(issue_from_dto(dto))
+    }
+
+    pub async fn list_issue_comments(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: i64,
+    ) -> Result<Vec<IssueComment>, GithubError> {
+        let mut comments = Vec::new();
+        let mut page = 1u32;
+        loop {
+            let page_value = page.to_string();
+            let url = Url::parse(&format!(
+                "{}/repos/{owner}/{repo}/issues/{number}/comments",
+                self.api_base
+            ))
+            .map_err(|error| GithubError::Decode {
+                context: "issue comments URL".to_owned(),
+                details: error.to_string(),
+            })?;
+            let request = self
+                .http
+                .get(url)
+                .query(&[("per_page", "100"), ("page", page_value.as_str())]);
+            let (_, _, body) = self.send(request).await?;
+            let page_items: Vec<CommentDto> = decode(&body, "issue comments")?;
+            let count = page_items.len();
+            comments.extend(page_items.into_iter().map(comment_from_dto));
+            if count < PER_PAGE || page >= 100 {
+                break;
+            }
+            page += 1;
+        }
+        Ok(comments)
+    }
+
+    pub async fn list_pulls(
+        &self,
+        owner: &str,
+        repo: &str,
+        state: &str,
+    ) -> Result<Vec<PullRequest>, GithubError> {
+        let mut pulls = Vec::new();
+        let mut page = 1u32;
+        loop {
+            let page_value = page.to_string();
+            let url = Url::parse(&format!("{}/repos/{owner}/{repo}/pulls", self.api_base))
+                .map_err(|error| GithubError::Decode {
+                    context: "pull requests URL".to_owned(),
+                    details: error.to_string(),
+                })?;
+            let request = self.http.get(url).query(&[
+                ("state", state),
+                ("sort", "updated"),
+                ("direction", "desc"),
+                ("per_page", "100"),
+                ("page", page_value.as_str()),
+            ]);
+            let (_, _, body) = self.send(request).await?;
+            let page_items: Vec<PullRequestDto> = decode(&body, "pull requests")?;
+            let count = page_items.len();
+            pulls.extend(page_items.into_iter().map(pull_from_dto));
+            if count < PER_PAGE || page >= 100 {
+                break;
+            }
+            page += 1;
+        }
+        Ok(pulls)
+    }
+
+    pub async fn get_pull(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: i64,
+    ) -> Result<PullRequest, GithubError> {
+        let url = Url::parse(&format!(
+            "{}/repos/{owner}/{repo}/pulls/{number}",
+            self.api_base
+        ))
+        .map_err(|error| GithubError::Decode {
+            context: "pull request URL".to_owned(),
+            details: error.to_string(),
+        })?;
+        let (_, _, body) = self.send(self.http.get(url)).await?;
+        let dto: PullRequestDto = decode(&body, "pull request")?;
+        Ok(pull_from_dto(dto))
+    }
+
+    pub async fn list_pull_files(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: i64,
+    ) -> Result<Vec<FilePatch>, GithubError> {
+        let mut files = Vec::new();
+        let mut page = 1u32;
+        loop {
+            let page_value = page.to_string();
+            let url = Url::parse(&format!(
+                "{}/repos/{owner}/{repo}/pulls/{number}/files",
+                self.api_base
+            ))
+            .map_err(|error| GithubError::Decode {
+                context: "pull files URL".to_owned(),
+                details: error.to_string(),
+            })?;
+            let request = self
+                .http
+                .get(url)
+                .query(&[("per_page", "100"), ("page", page_value.as_str())]);
+            let (_, _, body) = self.send(request).await?;
+            let page_items: Vec<FileDto> = decode(&body, "pull files")?;
+            let count = page_items.len();
+            files.extend(page_items.into_iter().map(file_from_dto));
+            if count < PER_PAGE || page >= 30 {
+                break;
+            }
+            page += 1;
+        }
+        Ok(files)
+    }
+
     fn contents_url(
         &self,
         owner: &str,
@@ -469,6 +652,64 @@ fn file_from_dto(dto: FileDto) -> FilePatch {
         deletions: dto.deletions,
         changes: dto.changes,
         patch: dto.patch,
+    }
+}
+
+fn issue_from_dto(dto: IssueDto) -> Issue {
+    Issue {
+        number: dto.number,
+        title: dto.title,
+        body: dto.body,
+        state: dto.state,
+        user: dto.user.map(|user| user.login),
+        labels: dto
+            .labels
+            .into_iter()
+            .map(|label| Label {
+                name: label.name,
+                color: label.color,
+            })
+            .collect(),
+        comments: dto.comments,
+        created_at: dto.created_at,
+        updated_at: dto.updated_at,
+        closed_at: dto.closed_at,
+        html_url: dto.html_url,
+    }
+}
+
+fn pull_from_dto(dto: PullRequestDto) -> PullRequest {
+    PullRequest {
+        number: dto.number,
+        title: dto.title,
+        body: dto.body,
+        state: dto.state,
+        merged: dto.merged,
+        draft: dto.draft,
+        user: dto.user.map(|user| user.login),
+        head_ref: dto.head.ref_name,
+        head_sha: dto.head.sha,
+        base_ref: dto.base.ref_name,
+        base_sha: dto.base.sha,
+        comments: dto.comments,
+        commits: dto.commits,
+        additions: dto.additions,
+        deletions: dto.deletions,
+        changed_files: dto.changed_files,
+        created_at: dto.created_at,
+        updated_at: dto.updated_at,
+        merged_at: dto.merged_at,
+        html_url: dto.html_url,
+    }
+}
+
+fn comment_from_dto(dto: CommentDto) -> IssueComment {
+    IssueComment {
+        id: dto.id,
+        body: dto.body,
+        user: dto.user.map(|user| user.login),
+        created_at: dto.created_at,
+        html_url: dto.html_url,
     }
 }
 
@@ -861,5 +1102,90 @@ mod tests {
         assert_eq!(releases.len(), 1);
         assert_eq!(releases[0].tag_name, "v0.1.0");
         assert_eq!(releases[0].assets.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn lists_issues_without_pull_requests() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/MiguelSilvaPorto/gitpanel/issues"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {
+                    "number": 1,
+                    "title": "Issue",
+                    "body": "Body",
+                    "state": "open",
+                    "user": { "login": "alice" },
+                    "labels": [{ "name": "bug", "color": "ff0000" }],
+                    "comments": 2,
+                    "created_at": "2026-01-01T00:00:00Z",
+                    "updated_at": "2026-01-02T00:00:00Z",
+                    "closed_at": null,
+                    "html_url": "https://github.com/MiguelSilvaPorto/gitpanel/issues/1"
+                },
+                {
+                    "number": 2,
+                    "title": "PR",
+                    "body": "Body",
+                    "state": "open",
+                    "user": { "login": "bob" },
+                    "labels": [],
+                    "comments": 0,
+                    "created_at": "2026-01-01T00:00:00Z",
+                    "updated_at": "2026-01-02T00:00:00Z",
+                    "closed_at": null,
+                    "html_url": "https://github.com/MiguelSilvaPorto/gitpanel/pull/2",
+                    "pull_request": { "url": "https://api.github.com/pulls/2" }
+                }
+            ])))
+            .mount(&server)
+            .await;
+        let client = GithubClient::with_base(Token::new("test"), server.uri()).expect("client");
+        let issues = client
+            .list_issues("MiguelSilvaPorto", "gitpanel", "open")
+            .await
+            .expect("issues");
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].number, 1);
+        assert_eq!(issues[0].labels[0].name, "bug");
+    }
+
+    #[tokio::test]
+    async fn lists_pull_requests() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/MiguelSilvaPorto/gitpanel/pulls"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!([{
+                    "number": 7,
+                    "title": "Feature",
+                    "body": "Body",
+                    "state": "open",
+                    "merged": false,
+                    "draft": true,
+                    "user": { "login": "alice" },
+                    "head": { "ref": "feature", "sha": "head-sha" },
+                    "base": { "ref": "main", "sha": "base-sha" },
+                    "comments": 3,
+                    "commits": 2,
+                    "additions": 10,
+                    "deletions": 2,
+                    "changed_files": 1,
+                    "created_at": "2026-01-01T00:00:00Z",
+                    "updated_at": "2026-01-02T00:00:00Z",
+                    "merged_at": null,
+                    "html_url": "https://github.com/MiguelSilvaPorto/gitpanel/pull/7"
+                }])),
+            )
+            .mount(&server)
+            .await;
+        let client = GithubClient::with_base(Token::new("test"), server.uri()).expect("client");
+        let pulls = client
+            .list_pulls("MiguelSilvaPorto", "gitpanel", "open")
+            .await
+            .expect("pulls");
+        assert_eq!(pulls.len(), 1);
+        assert_eq!(pulls[0].head_ref, "feature");
+        assert!(pulls[0].draft);
     }
 }

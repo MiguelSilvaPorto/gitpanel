@@ -3,6 +3,8 @@ tab-code = Código
 tab-commits = Commits
 tab-branches = Branches
 tab-releases = Releases
+tab-issues = Issues
+tab-pulls = Pull requests
 tab-charts = Gráficos
 tab-diff = Diff
 
@@ -53,3 +55,47 @@ releases-assets = { $count ->
 releases-no-body = Sem notas de release.
 releases-refresh = Recarregar releases
 releases-notes = Notas
+
+issues-title = Issues
+issues-empty = Nenhuma issue encontrada.
+issues-open = Abertas
+issues-closed = Fechadas
+issues-all = Todas
+issues-refresh = Recarregar issues
+issues-select = Selecione uma issue
+issues-comments = { $count ->
+    [one] { $count } comentário
+   *[other] { $count } comentários
+}
+issues-no-body = Sem descrição.
+issues-opened-by = por { $author }
+issues-updated-at = atualizada { $when }
+
+pulls-title = Pull requests
+pulls-empty = Nenhum pull request encontrado.
+pulls-open = Abertos
+pulls-closed = Fechados
+pulls-all = Todos
+pulls-refresh = Recarregar pull requests
+pulls-select = Selecione um pull request
+pulls-draft = rascunho
+pulls-merged = mesclado
+pulls-from-to = { $head } → { $base }
+pulls-comments = { $count ->
+    [one] { $count } comentário
+   *[other] { $count } comentários
+}
+pulls-commits = { $count ->
+    [one] { $count } commit
+   *[other] { $count } commits
+}
+pulls-files = { $count ->
+    [one] { $count } arquivo
+   *[other] { $count } arquivos
+}
+pulls-view-diff = Ver diff
+pulls-loading-diff = Carregando diff…
+pulls-no-diff = Nenhum arquivo de diff carregado.
+pulls-no-body = Sem descrição.
+pulls-opened-by = por { $author }
+pulls-updated-at = atualizado { $when }

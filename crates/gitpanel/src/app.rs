@@ -9,8 +9,9 @@ use egui::{
 };
 use gitpanel_config::{Config, ThemePreference};
 use gitpanel_core::{
-    Account, Branch, Commit, CommitData, ContentPayload, CreateRepoRequest, FilePatch, RateLimit,
-    Release, Repository, ValidationError, validate_description, validate_repo_name,
+    Account, Branch, Commit, CommitData, ContentPayload, CreateRepoRequest, FilePatch, Issue,
+    IssueComment, Label, PullRequest, RateLimit, Release, Repository, ValidationError,
+    validate_description, validate_repo_name,
 };
 use gitpanel_db::Db;
 use gitpanel_diff::{Diff, Highlighter};
@@ -42,6 +43,8 @@ enum RepoTab {
     Commits,
     Branches,
     Releases,
+    Issues,
+    Pulls,
     Charts,
     Diff,
 }
@@ -54,8 +57,10 @@ impl RepoTab {
             Self::Commits => 2,
             Self::Branches => 3,
             Self::Releases => 4,
-            Self::Charts => 5,
-            Self::Diff => 6,
+            Self::Issues => 5,
+            Self::Pulls => 6,
+            Self::Charts => 7,
+            Self::Diff => 8,
         }
     }
 
@@ -65,8 +70,10 @@ impl RepoTab {
             2 => Self::Commits,
             3 => Self::Branches,
             4 => Self::Releases,
-            5 => Self::Charts,
-            6 => Self::Diff,
+            5 => Self::Issues,
+            6 => Self::Pulls,
+            7 => Self::Charts,
+            8 => Self::Diff,
             _ => Self::Overview,
         }
     }
@@ -256,6 +263,40 @@ pub struct GitPanelApp {
     releases_source: DataSource,
     releases_pending: Option<Receiver<Result<Vec<Release>, GithubError>>>,
     releases_error: Option<String>,
+    issues_state: String,
+    issues: Vec<Issue>,
+    issues_repo: Option<i64>,
+    issues_source: DataSource,
+    issues_pending: Option<Receiver<Result<Vec<Issue>, GithubError>>>,
+    issues_error: Option<String>,
+    selected_issue: Option<Issue>,
+    issue_detail_source: DataSource,
+    issue_detail_pending: Option<Receiver<Result<Issue, GithubError>>>,
+    issue_detail_error: Option<String>,
+    issue_comments: Vec<IssueComment>,
+    issue_comments_source: DataSource,
+    issue_comments_pending: Option<Receiver<Result<Vec<IssueComment>, GithubError>>>,
+    issue_comments_error: Option<String>,
+    pulls_state: String,
+    pulls: Vec<PullRequest>,
+    pulls_repo: Option<i64>,
+    pulls_source: DataSource,
+    pulls_pending: Option<Receiver<Result<Vec<PullRequest>, GithubError>>>,
+    pulls_error: Option<String>,
+    selected_pull: Option<PullRequest>,
+    pull_detail_source: DataSource,
+    pull_detail_pending: Option<Receiver<Result<PullRequest, GithubError>>>,
+    pull_detail_error: Option<String>,
+    pull_comments: Vec<IssueComment>,
+    pull_comments_source: DataSource,
+    pull_comments_pending: Option<Receiver<Result<Vec<IssueComment>, GithubError>>>,
+    pull_comments_error: Option<String>,
+    pull_files: Vec<FilePatch>,
+    pull_files_source: DataSource,
+    pull_files_pending: Option<Receiver<Result<Vec<FilePatch>, GithubError>>>,
+    pull_files_error: Option<String>,
+    pull_diff: Option<Diff>,
+    pull_diff_state: DiffViewState,
     markdown_cache: CommonMarkCache,
     diff_source: DiffSource,
     diff_state: DiffViewState,
@@ -355,6 +396,40 @@ impl GitPanelApp {
             releases_source: DataSource::Remote,
             releases_pending: None,
             releases_error: None,
+            issues_state: "open".to_owned(),
+            issues: Vec::new(),
+            issues_repo: None,
+            issues_source: DataSource::Remote,
+            issues_pending: None,
+            issues_error: None,
+            selected_issue: None,
+            issue_detail_source: DataSource::Remote,
+            issue_detail_pending: None,
+            issue_detail_error: None,
+            issue_comments: Vec::new(),
+            issue_comments_source: DataSource::Remote,
+            issue_comments_pending: None,
+            issue_comments_error: None,
+            pulls_state: "open".to_owned(),
+            pulls: Vec::new(),
+            pulls_repo: None,
+            pulls_source: DataSource::Remote,
+            pulls_pending: None,
+            pulls_error: None,
+            selected_pull: None,
+            pull_detail_source: DataSource::Remote,
+            pull_detail_pending: None,
+            pull_detail_error: None,
+            pull_comments: Vec::new(),
+            pull_comments_source: DataSource::Remote,
+            pull_comments_pending: None,
+            pull_comments_error: None,
+            pull_files: Vec::new(),
+            pull_files_source: DataSource::Remote,
+            pull_files_pending: None,
+            pull_files_error: None,
+            pull_diff: None,
+            pull_diff_state: DiffViewState::default(),
             markdown_cache: CommonMarkCache::default(),
             diff_source: DiffSource::Commit,
             diff_state: DiffViewState::default(),
@@ -408,6 +483,14 @@ impl GitPanelApp {
                 Ok("releases") => {
                     app.repo_tab = RepoTab::Releases;
                     app.load_releases(&repository, false);
+                }
+                Ok("issues") => {
+                    app.repo_tab = RepoTab::Issues;
+                    app.load_issues(&repository, &app.issues_state.clone(), false);
+                }
+                Ok("pulls") => {
+                    app.repo_tab = RepoTab::Pulls;
+                    app.load_pulls(&repository, &app.pulls_state.clone(), false);
                 }
                 Ok("charts") => {
                     app.repo_tab = RepoTab::Charts;
@@ -581,6 +664,243 @@ impl GitPanelApp {
                 Err(TryRecvError::Disconnected) => {
                     self.releases_source = DataSource::Remote;
                     self.releases_pending = None;
+                }
+            }
+        }
+
+        if let Some(receiver) = self.issues_pending.take() {
+            match receiver.try_recv() {
+                Ok(Ok(issues)) => {
+                    if let Some(repo_id) = self.issues_repo
+                        && let Ok(payload) = serde_json::to_string(&issues)
+                        && let Err(error) = self.db.put_api_cache(
+                            repo_id,
+                            "issues",
+                            &self.issues_state.clone(),
+                            &payload,
+                        )
+                    {
+                        tracing::warn!(%error, "could not cache issues");
+                    }
+                    self.issues = issues;
+                    self.issues_source = DataSource::Local;
+                    self.issues_error = None;
+                    self.issues_pending = None;
+                }
+                Ok(Err(error)) => {
+                    self.issues_source = DataSource::Remote;
+                    self.issues_error = Some(self.github_error_title(&error));
+                    self.issues_pending = None;
+                }
+                Err(TryRecvError::Empty) => self.issues_pending = Some(receiver),
+                Err(TryRecvError::Disconnected) => {
+                    self.issues_source = DataSource::Remote;
+                    self.issues_pending = None;
+                }
+            }
+        }
+
+        if let Some(receiver) = self.pulls_pending.take() {
+            match receiver.try_recv() {
+                Ok(Ok(pulls)) => {
+                    if let Some(repo_id) = self.pulls_repo
+                        && let Ok(payload) = serde_json::to_string(&pulls)
+                        && let Err(error) = self.db.put_api_cache(
+                            repo_id,
+                            "pulls",
+                            &self.pulls_state.clone(),
+                            &payload,
+                        )
+                    {
+                        tracing::warn!(%error, "could not cache pulls");
+                    }
+                    self.pulls = pulls;
+                    self.pulls_source = DataSource::Local;
+                    self.pulls_error = None;
+                    self.pulls_pending = None;
+                }
+                Ok(Err(error)) => {
+                    self.pulls_source = DataSource::Remote;
+                    self.pulls_error = Some(self.github_error_title(&error));
+                    self.pulls_pending = None;
+                }
+                Err(TryRecvError::Empty) => self.pulls_pending = Some(receiver),
+                Err(TryRecvError::Disconnected) => {
+                    self.pulls_source = DataSource::Remote;
+                    self.pulls_pending = None;
+                }
+            }
+        }
+
+        if let Some(receiver) = self.issue_detail_pending.take() {
+            match receiver.try_recv() {
+                Ok(Ok(detail)) => {
+                    if let (Some(repo_id), Some(selected)) =
+                        (self.selected_repo_id, self.selected_issue.as_ref())
+                        && selected.number == detail.number
+                    {
+                        if let Ok(payload) = serde_json::to_string(&detail)
+                            && let Err(error) = self.db.put_api_cache(
+                                repo_id,
+                                "issue",
+                                &detail.number.to_string(),
+                                &payload,
+                            )
+                        {
+                            tracing::warn!(%error, "could not cache issue");
+                        }
+                        self.selected_issue = Some(detail);
+                        self.issue_detail_source = DataSource::Local;
+                        self.issue_detail_error = None;
+                    }
+                    self.issue_detail_pending = None;
+                }
+                Ok(Err(error)) => {
+                    self.issue_detail_source = DataSource::Remote;
+                    self.issue_detail_error = Some(self.github_error_title(&error));
+                    self.issue_detail_pending = None;
+                }
+                Err(TryRecvError::Empty) => self.issue_detail_pending = Some(receiver),
+                Err(TryRecvError::Disconnected) => {
+                    self.issue_detail_source = DataSource::Remote;
+                    self.issue_detail_pending = None;
+                }
+            }
+        }
+
+        if let Some(receiver) = self.issue_comments_pending.take() {
+            match receiver.try_recv() {
+                Ok(Ok(comments)) => {
+                    if let (Some(repo_id), Some(selected)) =
+                        (self.selected_repo_id, self.selected_issue.as_ref())
+                        && let Ok(payload) = serde_json::to_string(&comments)
+                        && let Err(error) = self.db.put_api_cache(
+                            repo_id,
+                            "issue-comments",
+                            &selected.number.to_string(),
+                            &payload,
+                        )
+                    {
+                        tracing::warn!(%error, "could not cache issue comments");
+                    }
+                    self.issue_comments = comments;
+                    self.issue_comments_source = DataSource::Local;
+                    self.issue_comments_error = None;
+                    self.issue_comments_pending = None;
+                }
+                Ok(Err(error)) => {
+                    self.issue_comments_source = DataSource::Remote;
+                    self.issue_comments_error = Some(self.github_error_title(&error));
+                    self.issue_comments_pending = None;
+                }
+                Err(TryRecvError::Empty) => self.issue_comments_pending = Some(receiver),
+                Err(TryRecvError::Disconnected) => {
+                    self.issue_comments_source = DataSource::Remote;
+                    self.issue_comments_pending = None;
+                }
+            }
+        }
+
+        if let Some(receiver) = self.pull_detail_pending.take() {
+            match receiver.try_recv() {
+                Ok(Ok(detail)) => {
+                    if let (Some(repo_id), Some(selected)) =
+                        (self.selected_repo_id, self.selected_pull.as_ref())
+                        && selected.number == detail.number
+                    {
+                        if let Ok(payload) = serde_json::to_string(&detail)
+                            && let Err(error) = self.db.put_api_cache(
+                                repo_id,
+                                "pull",
+                                &detail.number.to_string(),
+                                &payload,
+                            )
+                        {
+                            tracing::warn!(%error, "could not cache pull");
+                        }
+                        self.selected_pull = Some(detail);
+                        self.pull_detail_source = DataSource::Local;
+                        self.pull_detail_error = None;
+                    }
+                    self.pull_detail_pending = None;
+                }
+                Ok(Err(error)) => {
+                    self.pull_detail_source = DataSource::Remote;
+                    self.pull_detail_error = Some(self.github_error_title(&error));
+                    self.pull_detail_pending = None;
+                }
+                Err(TryRecvError::Empty) => self.pull_detail_pending = Some(receiver),
+                Err(TryRecvError::Disconnected) => {
+                    self.pull_detail_source = DataSource::Remote;
+                    self.pull_detail_pending = None;
+                }
+            }
+        }
+
+        if let Some(receiver) = self.pull_comments_pending.take() {
+            match receiver.try_recv() {
+                Ok(Ok(comments)) => {
+                    if let (Some(repo_id), Some(selected)) =
+                        (self.selected_repo_id, self.selected_pull.as_ref())
+                        && let Ok(payload) = serde_json::to_string(&comments)
+                        && let Err(error) = self.db.put_api_cache(
+                            repo_id,
+                            "pull-comments",
+                            &selected.number.to_string(),
+                            &payload,
+                        )
+                    {
+                        tracing::warn!(%error, "could not cache pull comments");
+                    }
+                    self.pull_comments = comments;
+                    self.pull_comments_source = DataSource::Local;
+                    self.pull_comments_error = None;
+                    self.pull_comments_pending = None;
+                }
+                Ok(Err(error)) => {
+                    self.pull_comments_source = DataSource::Remote;
+                    self.pull_comments_error = Some(self.github_error_title(&error));
+                    self.pull_comments_pending = None;
+                }
+                Err(TryRecvError::Empty) => self.pull_comments_pending = Some(receiver),
+                Err(TryRecvError::Disconnected) => {
+                    self.pull_comments_source = DataSource::Remote;
+                    self.pull_comments_pending = None;
+                }
+            }
+        }
+
+        if let Some(receiver) = self.pull_files_pending.take() {
+            match receiver.try_recv() {
+                Ok(Ok(files)) => {
+                    if let (Some(repo_id), Some(selected)) =
+                        (self.selected_repo_id, self.selected_pull.as_ref())
+                        && let Ok(payload) = serde_json::to_string(&files)
+                        && let Err(error) = self.db.put_api_cache(
+                            repo_id,
+                            "pull-files",
+                            &selected.number.to_string(),
+                            &payload,
+                        )
+                    {
+                        tracing::warn!(%error, "could not cache pull files");
+                    }
+                    self.pull_files = files;
+                    self.pull_diff = Some(Diff::from_patches(&self.pull_files));
+                    self.pull_files_source = DataSource::Local;
+                    self.pull_files_error = None;
+                    self.pull_diff_state = DiffViewState::default();
+                    self.pull_files_pending = None;
+                }
+                Ok(Err(error)) => {
+                    self.pull_files_source = DataSource::Remote;
+                    self.pull_files_error = Some(self.github_error_title(&error));
+                    self.pull_files_pending = None;
+                }
+                Err(TryRecvError::Empty) => self.pull_files_pending = Some(receiver),
+                Err(TryRecvError::Disconnected) => {
+                    self.pull_files_source = DataSource::Remote;
+                    self.pull_files_pending = None;
                 }
             }
         }
@@ -994,6 +1314,40 @@ impl GitPanelApp {
         self.releases_source = DataSource::Remote;
         self.releases_pending = None;
         self.releases_error = None;
+        self.issues.clear();
+        self.issues_repo = None;
+        self.issues_state = "open".to_owned();
+        self.issues_source = DataSource::Remote;
+        self.issues_pending = None;
+        self.issues_error = None;
+        self.selected_issue = None;
+        self.issue_detail_source = DataSource::Remote;
+        self.issue_detail_pending = None;
+        self.issue_detail_error = None;
+        self.issue_comments.clear();
+        self.issue_comments_source = DataSource::Remote;
+        self.issue_comments_pending = None;
+        self.issue_comments_error = None;
+        self.pulls.clear();
+        self.pulls_repo = None;
+        self.pulls_state = "open".to_owned();
+        self.pulls_source = DataSource::Remote;
+        self.pulls_pending = None;
+        self.pulls_error = None;
+        self.selected_pull = None;
+        self.pull_detail_source = DataSource::Remote;
+        self.pull_detail_pending = None;
+        self.pull_detail_error = None;
+        self.pull_comments.clear();
+        self.pull_comments_source = DataSource::Remote;
+        self.pull_comments_pending = None;
+        self.pull_comments_error = None;
+        self.pull_files.clear();
+        self.pull_files_source = DataSource::Remote;
+        self.pull_files_pending = None;
+        self.pull_files_error = None;
+        self.pull_diff = None;
+        self.pull_diff_state = DiffViewState::default();
         self.diff = None;
         self.diff_label.clear();
         self.diff_error = None;
@@ -1450,6 +1804,279 @@ impl GitPanelApp {
         self.releases_pending = Some(
             self.jobs
                 .spawn(async move { client.list_releases(&owner, &name).await }),
+        );
+    }
+
+    fn load_issues(&mut self, repository: &Repository, state: &str, refresh: bool) {
+        if self.issues_pending.is_some() {
+            return;
+        }
+        if !refresh && self.issues_repo == Some(repository.github_id) && self.issues_state == state
+        {
+            return;
+        }
+        if !refresh
+            && let Some(cached) = self
+                .db
+                .get_api_cache(repository.github_id, "issues", state)
+                .ok()
+                .flatten()
+            && let Ok(issues) = serde_json::from_str::<Vec<Issue>>(&cached)
+        {
+            self.issues = issues;
+            self.issues_repo = Some(repository.github_id);
+            self.issues_state = state.to_owned();
+            self.issues_source = DataSource::Local;
+            self.issues_error = None;
+            return;
+        }
+        let Some(client) = self.client.clone() else {
+            return;
+        };
+        self.issues_repo = Some(repository.github_id);
+        self.issues_state = state.to_owned();
+        self.issues_source = DataSource::Loading;
+        self.issues_error = None;
+        let owner = repository.owner.clone();
+        let name = repository.name.clone();
+        let state = state.to_owned();
+        self.issues_pending = Some(
+            self.jobs
+                .spawn(async move { client.list_issues(&owner, &name, &state).await }),
+        );
+    }
+
+    fn select_issue(&mut self, repository: &Repository, issue: Issue) {
+        self.selected_issue = Some(issue.clone());
+        self.issue_detail_source = DataSource::Remote;
+        self.issue_detail_pending = None;
+        self.issue_detail_error = None;
+        self.issue_comments.clear();
+        self.issue_comments_source = DataSource::Remote;
+        self.issue_comments_pending = None;
+        self.issue_comments_error = None;
+        self.load_issue_detail(repository, &issue, false);
+        self.load_issue_comments(repository, &issue, false);
+    }
+
+    fn load_issue_detail(&mut self, repository: &Repository, issue: &Issue, refresh: bool) {
+        if self.issue_detail_pending.is_some() {
+            return;
+        }
+        if !refresh
+            && let Some(cached) = self
+                .db
+                .get_api_cache(repository.github_id, "issue", &issue.number.to_string())
+                .ok()
+                .flatten()
+            && let Ok(detail) = serde_json::from_str::<Issue>(&cached)
+        {
+            self.selected_issue = Some(detail);
+            self.issue_detail_source = DataSource::Local;
+            self.issue_detail_error = None;
+            return;
+        }
+        let Some(client) = self.client.clone() else {
+            return;
+        };
+        self.issue_detail_source = DataSource::Loading;
+        self.issue_detail_error = None;
+        let owner = repository.owner.clone();
+        let name = repository.name.clone();
+        let number = issue.number;
+        self.issue_detail_pending = Some(
+            self.jobs
+                .spawn(async move { client.get_issue(&owner, &name, number).await }),
+        );
+    }
+
+    fn load_issue_comments(&mut self, repository: &Repository, issue: &Issue, refresh: bool) {
+        if self.issue_comments_pending.is_some() {
+            return;
+        }
+        if !refresh
+            && let Some(cached) = self
+                .db
+                .get_api_cache(
+                    repository.github_id,
+                    "issue-comments",
+                    &issue.number.to_string(),
+                )
+                .ok()
+                .flatten()
+            && let Ok(comments) = serde_json::from_str::<Vec<IssueComment>>(&cached)
+        {
+            self.issue_comments = comments;
+            self.issue_comments_source = DataSource::Local;
+            self.issue_comments_error = None;
+            return;
+        }
+        let Some(client) = self.client.clone() else {
+            return;
+        };
+        self.issue_comments_source = DataSource::Loading;
+        self.issue_comments_error = None;
+        let owner = repository.owner.clone();
+        let name = repository.name.clone();
+        let number = issue.number;
+        self.issue_comments_pending = Some(
+            self.jobs
+                .spawn(async move { client.list_issue_comments(&owner, &name, number).await }),
+        );
+    }
+
+    fn load_pulls(&mut self, repository: &Repository, state: &str, refresh: bool) {
+        if self.pulls_pending.is_some() {
+            return;
+        }
+        if !refresh && self.pulls_repo == Some(repository.github_id) && self.pulls_state == state {
+            return;
+        }
+        if !refresh
+            && let Some(cached) = self
+                .db
+                .get_api_cache(repository.github_id, "pulls", state)
+                .ok()
+                .flatten()
+            && let Ok(pulls) = serde_json::from_str::<Vec<PullRequest>>(&cached)
+        {
+            self.pulls = pulls;
+            self.pulls_repo = Some(repository.github_id);
+            self.pulls_state = state.to_owned();
+            self.pulls_source = DataSource::Local;
+            self.pulls_error = None;
+            return;
+        }
+        let Some(client) = self.client.clone() else {
+            return;
+        };
+        self.pulls_repo = Some(repository.github_id);
+        self.pulls_state = state.to_owned();
+        self.pulls_source = DataSource::Loading;
+        self.pulls_error = None;
+        let owner = repository.owner.clone();
+        let name = repository.name.clone();
+        let state = state.to_owned();
+        self.pulls_pending = Some(
+            self.jobs
+                .spawn(async move { client.list_pulls(&owner, &name, &state).await }),
+        );
+    }
+
+    fn select_pull(&mut self, repository: &Repository, pull: PullRequest) {
+        self.selected_pull = Some(pull.clone());
+        self.pull_detail_source = DataSource::Remote;
+        self.pull_detail_pending = None;
+        self.pull_detail_error = None;
+        self.pull_comments.clear();
+        self.pull_comments_source = DataSource::Remote;
+        self.pull_comments_pending = None;
+        self.pull_comments_error = None;
+        self.pull_files.clear();
+        self.pull_files_source = DataSource::Remote;
+        self.pull_files_pending = None;
+        self.pull_files_error = None;
+        self.pull_diff = None;
+        self.pull_diff_state = DiffViewState::default();
+        self.load_pull_detail(repository, &pull, false);
+        self.load_pull_comments(repository, &pull, false);
+    }
+
+    fn load_pull_detail(&mut self, repository: &Repository, pull: &PullRequest, refresh: bool) {
+        if self.pull_detail_pending.is_some() {
+            return;
+        }
+        if !refresh
+            && let Some(cached) = self
+                .db
+                .get_api_cache(repository.github_id, "pull", &pull.number.to_string())
+                .ok()
+                .flatten()
+            && let Ok(detail) = serde_json::from_str::<PullRequest>(&cached)
+        {
+            self.selected_pull = Some(detail);
+            self.pull_detail_source = DataSource::Local;
+            self.pull_detail_error = None;
+            return;
+        }
+        let Some(client) = self.client.clone() else {
+            return;
+        };
+        self.pull_detail_source = DataSource::Loading;
+        self.pull_detail_error = None;
+        let owner = repository.owner.clone();
+        let name = repository.name.clone();
+        let number = pull.number;
+        self.pull_detail_pending = Some(
+            self.jobs
+                .spawn(async move { client.get_pull(&owner, &name, number).await }),
+        );
+    }
+
+    fn load_pull_comments(&mut self, repository: &Repository, pull: &PullRequest, refresh: bool) {
+        if self.pull_comments_pending.is_some() {
+            return;
+        }
+        if !refresh
+            && let Some(cached) = self
+                .db
+                .get_api_cache(
+                    repository.github_id,
+                    "pull-comments",
+                    &pull.number.to_string(),
+                )
+                .ok()
+                .flatten()
+            && let Ok(comments) = serde_json::from_str::<Vec<IssueComment>>(&cached)
+        {
+            self.pull_comments = comments;
+            self.pull_comments_source = DataSource::Local;
+            self.pull_comments_error = None;
+            return;
+        }
+        let Some(client) = self.client.clone() else {
+            return;
+        };
+        self.pull_comments_source = DataSource::Loading;
+        self.pull_comments_error = None;
+        let owner = repository.owner.clone();
+        let name = repository.name.clone();
+        let number = pull.number;
+        self.pull_comments_pending = Some(
+            self.jobs
+                .spawn(async move { client.list_issue_comments(&owner, &name, number).await }),
+        );
+    }
+
+    fn load_pull_files(&mut self, repository: &Repository, pull: &PullRequest, refresh: bool) {
+        if self.pull_files_pending.is_some() {
+            return;
+        }
+        if !refresh
+            && let Some(cached) = self
+                .db
+                .get_api_cache(repository.github_id, "pull-files", &pull.number.to_string())
+                .ok()
+                .flatten()
+            && let Ok(files) = serde_json::from_str::<Vec<FilePatch>>(&cached)
+        {
+            self.pull_files = files;
+            self.pull_diff = Some(Diff::from_patches(&self.pull_files));
+            self.pull_files_source = DataSource::Local;
+            self.pull_files_error = None;
+            return;
+        }
+        let Some(client) = self.client.clone() else {
+            return;
+        };
+        self.pull_files_source = DataSource::Loading;
+        self.pull_files_error = None;
+        let owner = repository.owner.clone();
+        let name = repository.name.clone();
+        let number = pull.number;
+        self.pull_files_pending = Some(
+            self.jobs
+                .spawn(async move { client.list_pull_files(&owner, &name, number).await }),
         );
     }
 
@@ -1978,6 +2605,8 @@ impl GitPanelApp {
             self.translator.text(keys::TAB_COMMITS),
             self.translator.text(keys::TAB_BRANCHES),
             self.translator.text(keys::TAB_RELEASES),
+            self.translator.text(keys::TAB_ISSUES),
+            self.translator.text(keys::TAB_PULLS),
             self.translator.text(keys::TAB_CHARTS),
             self.translator.text(keys::TAB_DIFF),
         ];
@@ -1991,6 +2620,8 @@ impl GitPanelApp {
                 RepoTab::Commits => self.ensure_commits(&repository),
                 RepoTab::Branches => self.ensure_branches(&repository),
                 RepoTab::Releases => self.load_releases(&repository, false),
+                RepoTab::Issues => self.load_issues(&repository, &self.issues_state.clone(), false),
+                RepoTab::Pulls => self.load_pulls(&repository, &self.pulls_state.clone(), false),
                 RepoTab::Charts => {
                     if self.charts.repo_id != Some(repository.github_id) {
                         self.load_charts(repository.github_id);
@@ -2014,6 +2645,8 @@ impl GitPanelApp {
             RepoTab::Commits => self.commits_panel(ui, &repository),
             RepoTab::Branches => self.branches_panel(ui, &repository),
             RepoTab::Releases => self.releases_panel(ui, &repository),
+            RepoTab::Issues => self.issues_panel(ui, &repository),
+            RepoTab::Pulls => self.pulls_panel(ui, &repository),
             RepoTab::Charts => self.charts_panel(ui, &repository),
             RepoTab::Diff => self.diff_panel(ui, &repository),
         }
@@ -2828,6 +3461,553 @@ impl GitPanelApp {
         }
     }
 
+    fn issues_panel(&mut self, ui: &mut Ui, repository: &Repository) {
+        let palette = self.theme.palette;
+        self.load_issues(repository, &self.issues_state.clone(), false);
+        let mut state = self.issues_state.clone();
+        let mut refresh = false;
+        ui.horizontal_wrapped(|ui| {
+            ui.label(
+                RichText::new(self.translator.text(keys::ISSUES_TITLE))
+                    .size(15.0)
+                    .strong()
+                    .color(palette.fg_default),
+            );
+            source_badge(ui, self.issues_source, &self.translator, palette);
+            for (value, key) in [
+                ("open", keys::ISSUES_OPEN),
+                ("closed", keys::ISSUES_CLOSED),
+                ("all", keys::ISSUES_ALL),
+            ] {
+                ui.selectable_value(&mut state, value.to_owned(), self.translator.text(key));
+            }
+            if ui
+                .add(secondary_button(
+                    self.translator.text(keys::ISSUES_REFRESH),
+                    palette,
+                ))
+                .clicked()
+            {
+                refresh = true;
+            }
+        });
+        if state != self.issues_state {
+            self.issues_state = state;
+            self.issues.clear();
+            self.issues_repo = None;
+            self.issues_source = DataSource::Remote;
+            self.issues_pending = None;
+            self.selected_issue = None;
+            self.issue_detail_pending = None;
+            self.issue_comments_pending = None;
+            self.load_issues(repository, &self.issues_state.clone(), false);
+        } else if refresh {
+            self.load_issues(repository, &self.issues_state.clone(), true);
+        }
+        if let Some(error) = &self.issues_error {
+            error_banner(
+                ui,
+                &self.translator.text(keys::ERROR_GENERIC),
+                error,
+                palette,
+            );
+        }
+        if self.issues_source == DataSource::Loading {
+            loading(ui, &self.translator.text(keys::COMMON_LOADING), palette);
+        }
+        if self.issues.is_empty() {
+            if self.issues_source != DataSource::Loading {
+                empty_state(
+                    ui,
+                    &self.translator.text(keys::ISSUES_EMPTY),
+                    "",
+                    palette,
+                    Some(Icon::Warning),
+                );
+            }
+        } else {
+            let issues = self.issues.clone();
+            let mut selected = None;
+            ScrollArea::vertical()
+                .id_salt(("issues", self.issues_state.clone()))
+                .max_height(300.0)
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    for issue in issues {
+                        if issue_row(ui, &issue, &self.translator, palette) {
+                            selected = Some(issue);
+                        }
+                        ui.separator();
+                    }
+                });
+            if let Some(issue) = selected {
+                self.select_issue(repository, issue);
+            }
+        }
+        #[cfg(debug_assertions)]
+        if self.selected_issue.is_none()
+            && std::env::var("GITPANEL_AUTO_ISSUE").is_ok()
+            && let Some(issue) = self.issues.first().cloned()
+        {
+            self.select_issue(repository, issue);
+        }
+
+        if let Some(issue) = self.selected_issue.clone() {
+            ui.add_space(12.0);
+            card(ui, palette, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        RichText::new(format!("#{} {}", issue.number, issue.title))
+                            .size(15.0)
+                            .strong()
+                            .color(palette.fg_default),
+                    );
+                    badge(
+                        ui,
+                        if issue.state == "open" {
+                            self.translator.text(keys::ISSUES_OPEN)
+                        } else {
+                            self.translator.text(keys::ISSUES_CLOSED)
+                        },
+                        if issue.state == "open" {
+                            palette.diff_add_bg
+                        } else {
+                            palette.canvas_inset
+                        },
+                        if issue.state == "open" {
+                            palette.success_fg
+                        } else {
+                            palette.fg_muted
+                        },
+                    );
+                    source_badge(ui, self.issue_detail_source, &self.translator, palette);
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new(self.translator.text(keys::COMMON_OPEN_GITHUB))
+                                        .size(11.0)
+                                        .color(palette.accent_fg),
+                                )
+                                .frame(false),
+                            )
+                            .clicked()
+                        {
+                            ui.ctx()
+                                .open_url(egui::OpenUrl::new_tab(issue.html_url.clone()));
+                        }
+                    });
+                });
+                ui.horizontal_wrapped(|ui| {
+                    if let Some(author) = &issue.user {
+                        ui.label(
+                            RichText::new(
+                                self.translator.text_args(
+                                    keys::ISSUES_OPENED_BY,
+                                    &[Arg::str("author", author)],
+                                ),
+                            )
+                            .size(11.0)
+                            .color(palette.fg_muted),
+                        );
+                    }
+                    label_chips(ui, &issue.labels, palette);
+                });
+                ui.add_space(6.0);
+                if self.issue_detail_source == DataSource::Loading {
+                    loading(ui, &self.translator.text(keys::COMMON_LOADING), palette);
+                } else if let Some(error) = &self.issue_detail_error {
+                    error_banner(
+                        ui,
+                        &self.translator.text(keys::ERROR_GENERIC),
+                        error,
+                        palette,
+                    );
+                } else if let Some(body) = &issue.body {
+                    if body.trim().is_empty() {
+                        muted(ui, self.translator.text(keys::ISSUES_NO_BODY), palette);
+                    } else {
+                        markdown(ui, &mut self.markdown_cache, body);
+                    }
+                } else {
+                    muted(ui, self.translator.text(keys::ISSUES_NO_BODY), palette);
+                }
+            });
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(self.translator.text_args(
+                        keys::ISSUES_COMMENTS,
+                        &[Arg::int("count", i64::from(issue.comments))],
+                    ))
+                    .size(13.0)
+                    .strong()
+                    .color(palette.fg_default),
+                );
+                source_badge(ui, self.issue_comments_source, &self.translator, palette);
+            });
+            if self.issue_comments_source == DataSource::Loading {
+                loading(ui, &self.translator.text(keys::COMMON_LOADING), palette);
+            } else if let Some(error) = &self.issue_comments_error {
+                error_banner(
+                    ui,
+                    &self.translator.text(keys::ERROR_GENERIC),
+                    error,
+                    palette,
+                );
+            } else {
+                let comments = self.issue_comments.clone();
+                for comment in comments {
+                    card(ui, palette, |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(
+                                RichText::new(comment.user.as_deref().unwrap_or("—"))
+                                    .size(11.5)
+                                    .strong()
+                                    .color(palette.fg_default),
+                            );
+                            ui.label(
+                                RichText::new(format_date(
+                                    &self.translator,
+                                    comment.created_at,
+                                    true,
+                                ))
+                                .size(10.5)
+                                .color(palette.fg_subtle),
+                            );
+                        });
+                        ui.add_space(4.0);
+                        if let Some(body) = &comment.body {
+                            markdown(ui, &mut self.markdown_cache, body);
+                        }
+                    });
+                    ui.add_space(6.0);
+                }
+            }
+        } else {
+            muted(ui, self.translator.text(keys::ISSUES_SELECT), palette);
+        }
+    }
+
+    fn pulls_panel(&mut self, ui: &mut Ui, repository: &Repository) {
+        let palette = self.theme.palette;
+        self.load_pulls(repository, &self.pulls_state.clone(), false);
+        let mut state = self.pulls_state.clone();
+        let mut refresh = false;
+        ui.horizontal_wrapped(|ui| {
+            ui.label(
+                RichText::new(self.translator.text(keys::PULLS_TITLE))
+                    .size(15.0)
+                    .strong()
+                    .color(palette.fg_default),
+            );
+            source_badge(ui, self.pulls_source, &self.translator, palette);
+            for (value, key) in [
+                ("open", keys::PULLS_OPEN),
+                ("closed", keys::PULLS_CLOSED),
+                ("all", keys::PULLS_ALL),
+            ] {
+                ui.selectable_value(&mut state, value.to_owned(), self.translator.text(key));
+            }
+            if ui
+                .add(secondary_button(
+                    self.translator.text(keys::PULLS_REFRESH),
+                    palette,
+                ))
+                .clicked()
+            {
+                refresh = true;
+            }
+        });
+        if state != self.pulls_state {
+            self.pulls_state = state;
+            self.pulls.clear();
+            self.pulls_repo = None;
+            self.pulls_source = DataSource::Remote;
+            self.pulls_pending = None;
+            self.selected_pull = None;
+            self.pull_detail_pending = None;
+            self.pull_comments_pending = None;
+            self.pull_files_pending = None;
+            self.load_pulls(repository, &self.pulls_state.clone(), false);
+        } else if refresh {
+            self.load_pulls(repository, &self.pulls_state.clone(), true);
+        }
+        if let Some(error) = &self.pulls_error {
+            error_banner(
+                ui,
+                &self.translator.text(keys::ERROR_GENERIC),
+                error,
+                palette,
+            );
+        }
+        if self.pulls_source == DataSource::Loading {
+            loading(ui, &self.translator.text(keys::COMMON_LOADING), palette);
+        }
+        if self.pulls.is_empty() {
+            if self.pulls_source != DataSource::Loading {
+                empty_state(
+                    ui,
+                    &self.translator.text(keys::PULLS_EMPTY),
+                    "",
+                    palette,
+                    Some(Icon::Branch),
+                );
+            }
+        } else {
+            let pulls = self.pulls.clone();
+            let mut selected = None;
+            ScrollArea::vertical()
+                .id_salt(("pulls", self.pulls_state.clone()))
+                .max_height(300.0)
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    for pull in pulls {
+                        if pull_row(ui, &pull, &self.translator, palette) {
+                            selected = Some(pull);
+                        }
+                        ui.separator();
+                    }
+                });
+            if let Some(pull) = selected {
+                self.select_pull(repository, pull);
+            }
+        }
+        #[cfg(debug_assertions)]
+        if self.selected_pull.is_none()
+            && std::env::var("GITPANEL_AUTO_PULL").is_ok()
+            && let Some(pull) = self.pulls.first().cloned()
+        {
+            self.select_pull(repository, pull.clone());
+            if std::env::var("GITPANEL_AUTO_PULL_DIFF").is_ok() {
+                self.load_pull_files(repository, &pull, false);
+            }
+        }
+
+        if let Some(pull) = self.selected_pull.clone() {
+            ui.add_space(12.0);
+            card(ui, palette, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        RichText::new(format!("#{} {}", pull.number, pull.title))
+                            .size(15.0)
+                            .strong()
+                            .color(palette.fg_default),
+                    );
+                    if pull.merged {
+                        badge(
+                            ui,
+                            self.translator.text(keys::PULLS_MERGED),
+                            palette.selection_bg,
+                            palette.done_fg,
+                        );
+                    } else {
+                        badge(
+                            ui,
+                            if pull.state == "open" {
+                                self.translator.text(keys::PULLS_OPEN)
+                            } else {
+                                self.translator.text(keys::PULLS_CLOSED)
+                            },
+                            if pull.state == "open" {
+                                palette.diff_add_bg
+                            } else {
+                                palette.canvas_inset
+                            },
+                            if pull.state == "open" {
+                                palette.success_fg
+                            } else {
+                                palette.fg_muted
+                            },
+                        );
+                    }
+                    if pull.draft {
+                        badge(
+                            ui,
+                            self.translator.text(keys::PULLS_DRAFT),
+                            palette.canvas_inset,
+                            palette.fg_muted,
+                        );
+                    }
+                    source_badge(ui, self.pull_detail_source, &self.translator, palette);
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new(self.translator.text(keys::COMMON_OPEN_GITHUB))
+                                        .size(11.0)
+                                        .color(palette.accent_fg),
+                                )
+                                .frame(false),
+                            )
+                            .clicked()
+                        {
+                            ui.ctx()
+                                .open_url(egui::OpenUrl::new_tab(pull.html_url.clone()));
+                        }
+                    });
+                });
+                ui.horizontal_wrapped(|ui| {
+                    if let Some(author) = &pull.user {
+                        ui.label(
+                            RichText::new(
+                                self.translator.text_args(
+                                    keys::PULLS_OPENED_BY,
+                                    &[Arg::str("author", author)],
+                                ),
+                            )
+                            .size(11.0)
+                            .color(palette.fg_muted),
+                        );
+                    }
+                    ui.label(
+                        RichText::new(self.translator.text_args(
+                            keys::PULLS_FROM_TO,
+                            &[
+                                Arg::str("head", &pull.head_ref),
+                                Arg::str("base", &pull.base_ref),
+                            ],
+                        ))
+                        .size(11.0)
+                        .color(palette.fg_muted),
+                    );
+                });
+                ui.add_space(6.0);
+                if self.pull_detail_source == DataSource::Loading {
+                    loading(ui, &self.translator.text(keys::COMMON_LOADING), palette);
+                } else if let Some(error) = &self.pull_detail_error {
+                    error_banner(
+                        ui,
+                        &self.translator.text(keys::ERROR_GENERIC),
+                        error,
+                        palette,
+                    );
+                } else if let Some(body) = &pull.body {
+                    if body.trim().is_empty() {
+                        muted(ui, self.translator.text(keys::PULLS_NO_BODY), palette);
+                    } else {
+                        markdown(ui, &mut self.markdown_cache, body);
+                    }
+                } else {
+                    muted(ui, self.translator.text(keys::PULLS_NO_BODY), palette);
+                }
+                ui.add_space(8.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        RichText::new(self.translator.text_args(
+                            keys::PULLS_COMMITS,
+                            &[Arg::int("count", i64::from(pull.commits))],
+                        ))
+                        .size(11.0)
+                        .color(palette.fg_muted),
+                    );
+                    ui.label(
+                        RichText::new(self.translator.text_args(
+                            keys::PULLS_FILES,
+                            &[Arg::int("count", i64::from(pull.changed_files))],
+                        ))
+                        .size(11.0)
+                        .color(palette.fg_muted),
+                    );
+                    ui.label(
+                        RichText::new(format!("+{} −{}", pull.additions, pull.deletions))
+                            .size(11.0)
+                            .color(palette.fg_muted),
+                    );
+                    if ui
+                        .add(secondary_button(
+                            self.translator.text(keys::PULLS_VIEW_DIFF),
+                            palette,
+                        ))
+                        .clicked()
+                    {
+                        self.load_pull_files(repository, &pull, false);
+                    }
+                    source_badge(ui, self.pull_files_source, &self.translator, palette);
+                });
+                if self.pull_files_source == DataSource::Loading {
+                    loading(ui, &self.translator.text(keys::PULLS_LOADING_DIFF), palette);
+                } else if let Some(error) = &self.pull_files_error {
+                    error_banner(
+                        ui,
+                        &self.translator.text(keys::ERROR_GENERIC),
+                        error,
+                        palette,
+                    );
+                } else if let Some(diff) = &self.pull_diff {
+                    if self.highlighter.is_none() {
+                        self.highlighter = Some(Highlighter::new(self.theme.dark));
+                    }
+                    if let Some(highlighter) = &self.highlighter {
+                        diff_view(
+                            ui,
+                            diff,
+                            &self.translator,
+                            palette,
+                            highlighter,
+                            &mut self.pull_diff_state,
+                        );
+                    }
+                } else {
+                    muted(ui, self.translator.text(keys::PULLS_NO_DIFF), palette);
+                }
+            });
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(self.translator.text_args(
+                        keys::PULLS_COMMENTS,
+                        &[Arg::int("count", i64::from(pull.comments))],
+                    ))
+                    .size(13.0)
+                    .strong()
+                    .color(palette.fg_default),
+                );
+                source_badge(ui, self.pull_comments_source, &self.translator, palette);
+            });
+            if self.pull_comments_source == DataSource::Loading {
+                loading(ui, &self.translator.text(keys::COMMON_LOADING), palette);
+            } else if let Some(error) = &self.pull_comments_error {
+                error_banner(
+                    ui,
+                    &self.translator.text(keys::ERROR_GENERIC),
+                    error,
+                    palette,
+                );
+            } else {
+                let comments = self.pull_comments.clone();
+                for comment in comments {
+                    card(ui, palette, |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(
+                                RichText::new(comment.user.as_deref().unwrap_or("—"))
+                                    .size(11.5)
+                                    .strong()
+                                    .color(palette.fg_default),
+                            );
+                            ui.label(
+                                RichText::new(format_date(
+                                    &self.translator,
+                                    comment.created_at,
+                                    true,
+                                ))
+                                .size(10.5)
+                                .color(palette.fg_subtle),
+                            );
+                        });
+                        ui.add_space(4.0);
+                        if let Some(body) = &comment.body {
+                            markdown(ui, &mut self.markdown_cache, body);
+                        }
+                    });
+                    ui.add_space(6.0);
+                }
+            }
+        } else {
+            muted(ui, self.translator.text(keys::PULLS_SELECT), palette);
+        }
+    }
+
     fn charts_panel(&mut self, ui: &mut Ui, repository: &Repository) {
         let palette = self.theme.palette;
         if self.charts.repo_id != Some(repository.github_id) {
@@ -3614,6 +4794,8 @@ impl GitPanelApp {
                 RepoTab::Commits => self.ensure_commits(&repository),
                 RepoTab::Branches => self.ensure_branches(&repository),
                 RepoTab::Releases => self.load_releases(&repository, false),
+                RepoTab::Issues => self.load_issues(&repository, &self.issues_state.clone(), false),
+                RepoTab::Pulls => self.load_pulls(&repository, &self.pulls_state.clone(), false),
                 RepoTab::Charts => {
                     if self.charts.repo_id != Some(repository.github_id) {
                         self.load_charts(repository.github_id);
@@ -3824,6 +5006,181 @@ impl eframe::App for GitPanelApp {
             || self.branches_pending.is_some();
         ctx.request_repaint_after(Duration::from_millis(if busy { 200 } else { 1000 }));
     }
+}
+
+fn issue_row(ui: &mut Ui, issue: &Issue, translator: &Translator, palette: Palette) -> bool {
+    let mut clicked = false;
+    Frame::NONE
+        .inner_margin(Margin::symmetric(4, 6))
+        .show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                icon(
+                    ui,
+                    if issue.state == "open" {
+                        Icon::Warning
+                    } else {
+                        Icon::Check
+                    },
+                    14.0,
+                    if issue.state == "open" {
+                        palette.success_fg
+                    } else {
+                        palette.fg_muted
+                    },
+                );
+                if ui
+                    .add(
+                        egui::Button::new(
+                            RichText::new(format!("#{} {}", issue.number, issue.title))
+                                .size(12.5)
+                                .strong()
+                                .color(palette.fg_default),
+                        )
+                        .frame(false),
+                    )
+                    .clicked()
+                {
+                    clicked = true;
+                }
+                label_chips(ui, &issue.labels, palette);
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.label(
+                        RichText::new(translator.text_args(
+                            keys::ISSUES_COMMENTS,
+                            &[Arg::int("count", i64::from(issue.comments))],
+                        ))
+                        .size(10.5)
+                        .color(palette.fg_subtle),
+                    );
+                    ui.label(
+                        RichText::new(relative_time(translator, issue.updated_at, Utc::now()))
+                            .size(10.5)
+                            .color(palette.fg_subtle),
+                    );
+                    if let Some(author) = &issue.user {
+                        ui.label(RichText::new(author).size(10.5).color(palette.fg_muted));
+                    }
+                });
+            });
+        });
+    clicked
+}
+
+fn pull_row(ui: &mut Ui, pull: &PullRequest, translator: &Translator, palette: Palette) -> bool {
+    let mut clicked = false;
+    Frame::NONE
+        .inner_margin(Margin::symmetric(4, 6))
+        .show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                icon(
+                    ui,
+                    if pull.merged {
+                        Icon::Check
+                    } else {
+                        Icon::Branch
+                    },
+                    14.0,
+                    if pull.merged {
+                        palette.done_fg
+                    } else if pull.state == "open" {
+                        palette.success_fg
+                    } else {
+                        palette.fg_muted
+                    },
+                );
+                if ui
+                    .add(
+                        egui::Button::new(
+                            RichText::new(format!("#{} {}", pull.number, pull.title))
+                                .size(12.5)
+                                .strong()
+                                .color(palette.fg_default),
+                        )
+                        .frame(false),
+                    )
+                    .clicked()
+                {
+                    clicked = true;
+                }
+                if pull.merged {
+                    badge(
+                        ui,
+                        translator.text(keys::PULLS_MERGED),
+                        palette.selection_bg,
+                        palette.done_fg,
+                    );
+                } else if pull.draft {
+                    badge(
+                        ui,
+                        translator.text(keys::PULLS_DRAFT),
+                        palette.canvas_inset,
+                        palette.fg_muted,
+                    );
+                }
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.label(
+                        RichText::new(translator.text_args(
+                            keys::PULLS_COMMENTS,
+                            &[Arg::int("count", i64::from(pull.comments))],
+                        ))
+                        .size(10.5)
+                        .color(palette.fg_subtle),
+                    );
+                    ui.label(
+                        RichText::new(relative_time(translator, pull.updated_at, Utc::now()))
+                            .size(10.5)
+                            .color(palette.fg_subtle),
+                    );
+                    if let Some(author) = &pull.user {
+                        ui.label(RichText::new(author).size(10.5).color(palette.fg_muted));
+                    }
+                });
+            });
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    RichText::new(translator.text_args(
+                        keys::PULLS_FROM_TO,
+                        &[
+                            Arg::str("head", &pull.head_ref),
+                            Arg::str("base", &pull.base_ref),
+                        ],
+                    ))
+                    .size(10.5)
+                    .color(palette.fg_subtle),
+                );
+                if pull.additions > 0 || pull.deletions > 0 {
+                    ui.label(
+                        RichText::new(format!("+{} −{}", pull.additions, pull.deletions))
+                            .size(10.5)
+                            .color(palette.fg_subtle),
+                    );
+                }
+            });
+        });
+    clicked
+}
+
+fn label_chips(ui: &mut Ui, labels: &[Label], palette: Palette) {
+    for label in labels {
+        let color = parse_label_color(&label.color).unwrap_or(palette.canvas_inset);
+        let foreground = if color.r() as u16 + color.g() as u16 + color.b() as u16 > 380 {
+            Color32::BLACK
+        } else {
+            Color32::WHITE
+        };
+        badge(ui, &label.name, color, foreground);
+    }
+}
+
+fn parse_label_color(value: &str) -> Option<Color32> {
+    let value = value.trim_start_matches('#');
+    if value.len() != 6 {
+        return None;
+    }
+    let red = u8::from_str_radix(&value[0..2], 16).ok()?;
+    let green = u8::from_str_radix(&value[2..4], 16).ok()?;
+    let blue = u8::from_str_radix(&value[4..6], 16).ok()?;
+    Some(Color32::from_rgb(red, green, blue))
 }
 
 fn commit_row(ui: &mut Ui, commit: &Commit, translator: &Translator, palette: Palette) -> bool {
