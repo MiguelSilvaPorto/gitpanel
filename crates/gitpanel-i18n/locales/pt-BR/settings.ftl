@@ -36,3 +36,17 @@ settings-language-pt-br = Português (Brasil)
 settings-theme-system = Sistema
 settings-theme-light = Claro
 settings-theme-dark = Escuro
+settings-cache = Cache e armazenamento
+settings-cache-enabled = Usar cache local
+settings-cache-keep = Retenção do cache (dias)
+settings-cache-max-file = Tamanho máximo de arquivo em cache (KB)
+settings-cache-hint = As configurações ficam no config.toml. O SQLite guarda dados sincronizados e caches; desative o cache e use “Limpar cache” para remover o que já existe.
+settings-cache-db-size = Banco local
+settings-cache-rows = { $count ->
+    [one] { $count } registro em cache
+   *[other] { $count } registros em cache
+}
+settings-cache-clear = Limpar cache
+settings-cache-vacuum = Compactar banco
+settings-cache-cleared = Cache limpo.
+settings-cache-vacuumed = Banco compactado.

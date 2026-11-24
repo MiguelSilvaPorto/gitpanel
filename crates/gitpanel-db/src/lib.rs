@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 use gitpanel_core::{Branch, Commit, CommitData, Repository};
 use rusqlite::{Connection, OptionalExtension, params};
 use thiserror::Error;
@@ -107,6 +107,21 @@ CREATE TABLE IF NOT EXISTS sync_runs (
 #[derive(Clone)]
 pub struct Db {
     path: Arc<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct CacheStats {
+    pub api_rows: u64,
+    pub content_rows: u64,
+    pub release_rows: u64,
+    pub diff_rows: u64,
+    pub database_bytes: u64,
+}
+
+impl CacheStats {
+    pub fn total_rows(&self) -> u64 {
+        self.api_rows + self.content_rows + self.release_rows + self.diff_rows
+    }
 }
 
 impl Db {
@@ -618,6 +633,62 @@ impl Db {
             .map_err(DbError::from)
     }
 
+    pub fn cache_stats(&self) -> Result<CacheStats, DbError> {
+        let connection = self.connection()?;
+        let count = |table: &str| -> Result<u64, DbError> {
+            let sql = format!("SELECT COUNT(*) FROM {table}");
+            let value: i64 = connection.query_row(&sql, [], |row| row.get(0))?;
+            Ok(value.max(0) as u64)
+        };
+        let mut database_bytes = std::fs::metadata(self.path.as_ref())
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        if let Some(wal) = self.path.to_str().map(|path| format!("{path}-wal")) {
+            database_bytes += std::fs::metadata(wal)
+                .map(|metadata| metadata.len())
+                .unwrap_or(0);
+        }
+        Ok(CacheStats {
+            api_rows: count("api_cache")?,
+            content_rows: count("content_cache")?,
+            release_rows: count("release_cache")?,
+            diff_rows: count("diff_cache")?,
+            database_bytes,
+        })
+    }
+
+    pub fn prune_cache(&self, keep_days: u32) -> Result<usize, DbError> {
+        let connection = self.connection()?;
+        let cutoff = (Utc::now() - TimeDelta::days(i64::from(keep_days.max(1)))).to_rfc3339();
+        let mut removed = 0;
+        for (table, column) in [
+            ("api_cache", "fetched_at"),
+            ("content_cache", "fetched_at"),
+            ("release_cache", "fetched_at"),
+            ("diff_cache", "created_at"),
+        ] {
+            let sql = format!("DELETE FROM {table} WHERE {column} < ?1");
+            removed += connection.execute(&sql, [&cutoff])?;
+        }
+        Ok(removed)
+    }
+
+    pub fn clear_cache(&self) -> Result<usize, DbError> {
+        let connection = self.connection()?;
+        let mut removed = 0;
+        for table in ["api_cache", "content_cache", "release_cache", "diff_cache"] {
+            let sql = format!("DELETE FROM {table}");
+            removed += connection.execute(&sql, [])?;
+        }
+        Ok(removed)
+    }
+
+    pub fn vacuum(&self) -> Result<(), DbError> {
+        let connection = self.connection()?;
+        connection.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); VACUUM;")?;
+        Ok(())
+    }
+
     pub fn put_api_cache(
         &self,
         repo_id: i64,
@@ -880,5 +951,23 @@ mod tests {
             db.get_api_cache(1, "issues", "open").expect("api get"),
             Some("[]".to_owned())
         );
+    }
+
+    #[test]
+    fn reports_and_clears_cache() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db = Db::open(temp.path().join("test.db")).expect("db");
+        db.upsert_repositories(&[repo()]).expect("repo");
+        db.put_content_cache(1, "main", "README.md", "{}")
+            .expect("content");
+        db.put_release_cache(1, "[]").expect("releases");
+        db.put_api_cache(1, "issues", "open", "[]").expect("api");
+        db.put_diff_cache(1, "a", "b", "{}").expect("diff");
+        let stats = db.cache_stats().expect("stats");
+        assert_eq!(stats.total_rows(), 4);
+        assert!(stats.database_bytes > 0);
+        assert_eq!(db.clear_cache().expect("clear"), 4);
+        assert_eq!(db.cache_stats().expect("stats").total_rows(), 0);
+        db.vacuum().expect("vacuum");
     }
 }

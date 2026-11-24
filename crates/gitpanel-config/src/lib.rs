@@ -56,15 +56,42 @@ impl SyncSettings {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheSettings {
+    pub enabled: bool,
+    pub keep_days: u32,
+    pub max_file_kb: u64,
+}
+
+impl Default for CacheSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            keep_days: 30,
+            max_file_kb: 256,
+        }
+    }
+}
+
+impl CacheSettings {
+    pub fn normalize(&mut self) {
+        self.keep_days = self.keep_days.clamp(1, 365);
+        self.max_file_kb = self.max_file_kb.clamp(16, 4096);
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct Settings {
     pub ui: UiSettings,
     pub sync: SyncSettings,
+    #[serde(default)]
+    pub cache: CacheSettings,
 }
 
 impl Settings {
     pub fn normalize(&mut self) {
         self.sync.normalize();
+        self.cache.normalize();
     }
 }
 

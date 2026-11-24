@@ -419,7 +419,7 @@ impl GithubClient {
                 page_items
                     .into_iter()
                     .filter(|issue| issue.pull_request.is_none())
-                    .map(issue_from_dto),
+                    .map(|issue| issue_from_dto(issue, false)),
             );
             if count < PER_PAGE || page >= 100 {
                 break;
@@ -445,7 +445,7 @@ impl GithubClient {
         })?;
         let (_, _, body) = self.send(self.http.get(url)).await?;
         let dto: IssueDto = decode(&body, "issue")?;
-        Ok(issue_from_dto(dto))
+        Ok(issue_from_dto(dto, true))
     }
 
     pub async fn list_issue_comments(
@@ -507,7 +507,11 @@ impl GithubClient {
             let (_, _, body) = self.send(request).await?;
             let page_items: Vec<PullRequestDto> = decode(&body, "pull requests")?;
             let count = page_items.len();
-            pulls.extend(page_items.into_iter().map(pull_from_dto));
+            pulls.extend(
+                page_items
+                    .into_iter()
+                    .map(|pull| pull_from_dto(pull, false)),
+            );
             if count < PER_PAGE || page >= 100 {
                 break;
             }
@@ -532,7 +536,7 @@ impl GithubClient {
         })?;
         let (_, _, body) = self.send(self.http.get(url)).await?;
         let dto: PullRequestDto = decode(&body, "pull request")?;
-        Ok(pull_from_dto(dto))
+        Ok(pull_from_dto(dto, true))
     }
 
     pub async fn list_pull_files(
@@ -655,7 +659,10 @@ fn file_from_dto(dto: FileDto) -> FilePatch {
     }
 }
 
-fn issue_from_dto(dto: IssueDto) -> Issue {
+fn issue_from_dto(mut dto: IssueDto, include_body: bool) -> Issue {
+    if !include_body {
+        dto.body = None;
+    }
     Issue {
         number: dto.number,
         title: dto.title,
@@ -678,7 +685,10 @@ fn issue_from_dto(dto: IssueDto) -> Issue {
     }
 }
 
-fn pull_from_dto(dto: PullRequestDto) -> PullRequest {
+fn pull_from_dto(mut dto: PullRequestDto, include_body: bool) -> PullRequest {
+    if !include_body {
+        dto.body = None;
+    }
     PullRequest {
         number: dto.number,
         title: dto.title,
@@ -1148,6 +1158,7 @@ mod tests {
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].number, 1);
         assert_eq!(issues[0].labels[0].name, "bug");
+        assert!(issues[0].body.is_none());
     }
 
     #[tokio::test]
@@ -1187,5 +1198,6 @@ mod tests {
         assert_eq!(pulls.len(), 1);
         assert_eq!(pulls[0].head_ref, "feature");
         assert!(pulls[0].draft);
+        assert!(pulls[0].body.is_none());
     }
 }

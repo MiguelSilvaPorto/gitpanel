@@ -143,6 +143,9 @@ struct SettingsForm {
     interval_minutes: u64,
     backfill_days: u32,
     sync_all: bool,
+    cache_enabled: bool,
+    cache_keep_days: u32,
+    cache_max_file_kb: u64,
 }
 
 impl SettingsForm {
@@ -153,6 +156,9 @@ impl SettingsForm {
             interval_minutes: config.settings.sync.interval_minutes,
             backfill_days: config.settings.sync.backfill_days,
             sync_all: config.settings.sync.sync_all_accessible,
+            cache_enabled: config.settings.cache.enabled,
+            cache_keep_days: config.settings.cache.keep_days,
+            cache_max_file_kb: config.settings.cache.max_file_kb,
         }
     }
 }
@@ -324,6 +330,9 @@ impl GitPanelApp {
             Translator::new(&config.settings.ui.language).context("could not load translations")?;
         let db = Db::open(config.paths.database_file.clone())
             .context("could not open the local database")?;
+        if let Err(error) = db.prune_cache(config.settings.cache.keep_days) {
+            tracing::warn!(%error, "could not prune old cache entries");
+        }
         let jobs = Jobs::new().context("could not start the background runtime")?;
         let system_dark = cc
             .egui_ctx
@@ -642,13 +651,10 @@ impl GitPanelApp {
         if let Some(receiver) = self.releases_pending.take() {
             match receiver.try_recv() {
                 Ok(Ok(releases)) => {
-                    if self.releases_repo.is_some()
+                    if let Some(repo_id) = self.releases_repo
                         && let Ok(payload) = serde_json::to_string(&releases)
-                        && let Err(error) = self
-                            .db
-                            .put_release_cache(self.releases_repo.unwrap_or_default(), &payload)
                     {
-                        tracing::warn!(%error, "could not cache releases");
+                        self.cache_release(repo_id, &payload);
                     }
                     self.releases = releases;
                     self.releases_source = DataSource::Local;
@@ -673,14 +679,8 @@ impl GitPanelApp {
                 Ok(Ok(issues)) => {
                     if let Some(repo_id) = self.issues_repo
                         && let Ok(payload) = serde_json::to_string(&issues)
-                        && let Err(error) = self.db.put_api_cache(
-                            repo_id,
-                            "issues",
-                            &self.issues_state.clone(),
-                            &payload,
-                        )
                     {
-                        tracing::warn!(%error, "could not cache issues");
+                        self.cache_api(repo_id, "issues", &self.issues_state.clone(), &payload);
                     }
                     self.issues = issues;
                     self.issues_source = DataSource::Local;
@@ -705,14 +705,8 @@ impl GitPanelApp {
                 Ok(Ok(pulls)) => {
                     if let Some(repo_id) = self.pulls_repo
                         && let Ok(payload) = serde_json::to_string(&pulls)
-                        && let Err(error) = self.db.put_api_cache(
-                            repo_id,
-                            "pulls",
-                            &self.pulls_state.clone(),
-                            &payload,
-                        )
                     {
-                        tracing::warn!(%error, "could not cache pulls");
+                        self.cache_api(repo_id, "pulls", &self.pulls_state.clone(), &payload);
                     }
                     self.pulls = pulls;
                     self.pulls_source = DataSource::Local;
@@ -739,15 +733,8 @@ impl GitPanelApp {
                         (self.selected_repo_id, self.selected_issue.as_ref())
                         && selected.number == detail.number
                     {
-                        if let Ok(payload) = serde_json::to_string(&detail)
-                            && let Err(error) = self.db.put_api_cache(
-                                repo_id,
-                                "issue",
-                                &detail.number.to_string(),
-                                &payload,
-                            )
-                        {
-                            tracing::warn!(%error, "could not cache issue");
+                        if let Ok(payload) = serde_json::to_string(&detail) {
+                            self.cache_api(repo_id, "issue", &detail.number.to_string(), &payload);
                         }
                         self.selected_issue = Some(detail);
                         self.issue_detail_source = DataSource::Local;
@@ -774,14 +761,13 @@ impl GitPanelApp {
                     if let (Some(repo_id), Some(selected)) =
                         (self.selected_repo_id, self.selected_issue.as_ref())
                         && let Ok(payload) = serde_json::to_string(&comments)
-                        && let Err(error) = self.db.put_api_cache(
+                    {
+                        self.cache_api(
                             repo_id,
                             "issue-comments",
                             &selected.number.to_string(),
                             &payload,
-                        )
-                    {
-                        tracing::warn!(%error, "could not cache issue comments");
+                        );
                     }
                     self.issue_comments = comments;
                     self.issue_comments_source = DataSource::Local;
@@ -808,15 +794,8 @@ impl GitPanelApp {
                         (self.selected_repo_id, self.selected_pull.as_ref())
                         && selected.number == detail.number
                     {
-                        if let Ok(payload) = serde_json::to_string(&detail)
-                            && let Err(error) = self.db.put_api_cache(
-                                repo_id,
-                                "pull",
-                                &detail.number.to_string(),
-                                &payload,
-                            )
-                        {
-                            tracing::warn!(%error, "could not cache pull");
+                        if let Ok(payload) = serde_json::to_string(&detail) {
+                            self.cache_api(repo_id, "pull", &detail.number.to_string(), &payload);
                         }
                         self.selected_pull = Some(detail);
                         self.pull_detail_source = DataSource::Local;
@@ -843,14 +822,13 @@ impl GitPanelApp {
                     if let (Some(repo_id), Some(selected)) =
                         (self.selected_repo_id, self.selected_pull.as_ref())
                         && let Ok(payload) = serde_json::to_string(&comments)
-                        && let Err(error) = self.db.put_api_cache(
+                    {
+                        self.cache_api(
                             repo_id,
                             "pull-comments",
                             &selected.number.to_string(),
                             &payload,
-                        )
-                    {
-                        tracing::warn!(%error, "could not cache pull comments");
+                        );
                     }
                     self.pull_comments = comments;
                     self.pull_comments_source = DataSource::Local;
@@ -876,14 +854,13 @@ impl GitPanelApp {
                     if let (Some(repo_id), Some(selected)) =
                         (self.selected_repo_id, self.selected_pull.as_ref())
                         && let Ok(payload) = serde_json::to_string(&files)
-                        && let Err(error) = self.db.put_api_cache(
+                    {
+                        self.cache_api(
                             repo_id,
                             "pull-files",
                             &selected.number.to_string(),
                             &payload,
-                        )
-                    {
-                        tracing::warn!(%error, "could not cache pull files");
+                        );
                     }
                     self.pull_files = files;
                     self.pull_diff = Some(Diff::from_patches(&self.pull_files));
@@ -913,11 +890,8 @@ impl GitPanelApp {
                         self.contents_branch.clone(),
                         payload.path.clone(),
                     ) && let Ok(serialized) = serde_json::to_string(&payload)
-                        && let Err(error) =
-                            self.db
-                                .put_content_cache(repo_id, &branch, &path, &serialized)
                     {
-                        tracing::warn!(%error, "could not cache contents");
+                        self.cache_content(repo_id, &branch, &path, &serialized);
                     }
                     self.contents = Some(payload);
                     self.contents_source = DataSource::Local;
@@ -942,14 +916,8 @@ impl GitPanelApp {
                 Ok(Ok(readme)) => {
                     if let (Some(repo_id), Some(payload)) = (self.readme_repo, readme.as_ref())
                         && let Ok(serialized) = serde_json::to_string(payload)
-                        && let Err(error) = self.db.put_content_cache(
-                            repo_id,
-                            &self.readme_branch,
-                            "__readme__",
-                            &serialized,
-                        )
                     {
-                        tracing::warn!(%error, "could not cache readme");
+                        self.cache_content(repo_id, &self.readme_branch, "__readme__", &serialized);
                     }
                     self.readme = readme;
                     self.readme_source = DataSource::Local;
@@ -975,14 +943,8 @@ impl GitPanelApp {
                     if let (Some(repo_id), Some(path)) =
                         (self.selected_repo_id, self.code_file_path.clone())
                         && let Ok(serialized) = serde_json::to_string(&payload)
-                        && let Err(error) = self.db.put_content_cache(
-                            repo_id,
-                            &self.selected_branch,
-                            &path,
-                            &serialized,
-                        )
                     {
-                        tracing::warn!(%error, "could not cache file");
+                        self.cache_content(repo_id, &self.selected_branch, &path, &serialized);
                     }
                     self.code_file = Some(payload);
                     self.file_source = DataSource::Local;
@@ -2140,6 +2102,7 @@ impl GitPanelApp {
         self.diff = None;
         self.diff_label = label.clone();
         let job_label = label;
+        let cache_enabled = self.cache_enabled();
         self.diff_pending = Some(self.jobs.spawn(async move {
             if let Some(payload) = db
                 .get_diff_cache(repo_id, &base_key, &head_key)
@@ -2162,6 +2125,7 @@ impl GitPanelApp {
                 }
             };
             if let Ok(payload) = serde_json::to_string(&files)
+                && cache_enabled
                 && payload.len() <= 4_000_000
                 && let Err(error) = db.put_diff_cache(repo_id, &base_key, &head_key, &payload)
             {
@@ -2188,18 +2152,29 @@ impl GitPanelApp {
         let sync_changed = self.config.settings.sync.interval_minutes != form.interval_minutes
             || self.config.settings.sync.backfill_days != form.backfill_days
             || self.config.settings.sync.sync_all_accessible != form.sync_all;
+        let cache_changed = self.config.settings.cache.enabled != form.cache_enabled
+            || self.config.settings.cache.keep_days != form.cache_keep_days
+            || self.config.settings.cache.max_file_kb != form.cache_max_file_kb;
         self.settings = form.clone();
         self.config.settings.ui.theme = form.theme;
         self.config.settings.ui.language = form.language.clone();
         self.config.settings.sync.interval_minutes = form.interval_minutes;
         self.config.settings.sync.backfill_days = form.backfill_days;
         self.config.settings.sync.sync_all_accessible = form.sync_all;
+        self.config.settings.cache.enabled = form.cache_enabled;
+        self.config.settings.cache.keep_days = form.cache_keep_days;
+        self.config.settings.cache.max_file_kb = form.cache_max_file_kb;
         self.config.settings.normalize();
         if let Err(error) = self.config.save() {
             self.toast(
                 format!("{}: {error}", self.translator.text(keys::ERROR_CONFIG)),
                 ToastKind::Error,
             );
+        }
+        if cache_changed
+            && let Err(error) = self.db.prune_cache(self.config.settings.cache.keep_days)
+        {
+            tracing::warn!(%error, "could not prune cache after settings change");
         }
         if language_changed {
             match Translator::new(&self.config.settings.ui.language) {
@@ -2253,6 +2228,38 @@ impl GitPanelApp {
             kind,
             created: Instant::now(),
         });
+    }
+
+    fn cache_enabled(&self) -> bool {
+        self.config.settings.cache.enabled
+    }
+
+    fn cache_api(&self, repo_id: i64, kind: &str, key: &str, payload: &str) {
+        if !self.cache_enabled() || payload.len() > 512 * 1024 {
+            return;
+        }
+        if let Err(error) = self.db.put_api_cache(repo_id, kind, key, payload) {
+            tracing::warn!(%error, "could not write API cache");
+        }
+    }
+
+    fn cache_content(&self, repo_id: i64, branch: &str, path: &str, payload: &str) {
+        let limit = self.config.settings.cache.max_file_kb as usize * 1024;
+        if !self.cache_enabled() || payload.len() > limit {
+            return;
+        }
+        if let Err(error) = self.db.put_content_cache(repo_id, branch, path, payload) {
+            tracing::warn!(%error, "could not write content cache");
+        }
+    }
+
+    fn cache_release(&self, repo_id: i64, payload: &str) {
+        if !self.cache_enabled() || payload.len() > 2 * 1024 * 1024 {
+            return;
+        }
+        if let Err(error) = self.db.put_release_cache(repo_id, payload) {
+            tracing::warn!(%error, "could not write release cache");
+        }
     }
 
     fn validation_text(&self, error: &ValidationError) -> String {
@@ -4332,6 +4339,9 @@ impl GitPanelApp {
         let mut form = self.settings.clone();
         let mut save = false;
         let mut reload = false;
+        let mut clear_cache = false;
+        let mut vacuum = false;
+        let cache_stats = self.db.cache_stats().ok();
         page_header(
             ui,
             &self.translator.text(keys::SETTINGS_TITLE),
@@ -4503,6 +4513,74 @@ impl GitPanelApp {
         ui.add_space(12.0);
         card(ui, palette, |ui| {
             ui.label(
+                RichText::new(self.translator.text(keys::SETTINGS_CACHE))
+                    .size(15.0)
+                    .strong()
+                    .color(palette.fg_default),
+            );
+            ui.add_space(4.0);
+            ui.checkbox(
+                &mut form.cache_enabled,
+                self.translator.text(keys::SETTINGS_CACHE_ENABLED),
+            );
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(self.translator.text(keys::SETTINGS_CACHE_KEEP))
+                        .size(12.0)
+                        .color(palette.fg_muted),
+                );
+                ui.add(egui::DragValue::new(&mut form.cache_keep_days).range(1..=365));
+            });
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(self.translator.text(keys::SETTINGS_CACHE_MAX_FILE))
+                        .size(12.0)
+                        .color(palette.fg_muted),
+                );
+                ui.add(egui::DragValue::new(&mut form.cache_max_file_kb).range(16..=4096));
+            });
+            muted(ui, self.translator.text(keys::SETTINGS_CACHE_HINT), palette);
+            if let Some(stats) = cache_stats {
+                kv_row(
+                    ui,
+                    &self.translator.text(keys::SETTINGS_CACHE_DB_SIZE),
+                    &format_bytes(stats.database_bytes),
+                    palette,
+                );
+                kv_row(
+                    ui,
+                    &self.translator.text(keys::SETTINGS_CACHE),
+                    &self.translator.text_args(
+                        keys::SETTINGS_CACHE_ROWS,
+                        &[Arg::int("count", stats.total_rows() as i64)],
+                    ),
+                    palette,
+                );
+            }
+            ui.horizontal(|ui| {
+                if ui
+                    .add(secondary_button(
+                        self.translator.text(keys::SETTINGS_CACHE_CLEAR),
+                        palette,
+                    ))
+                    .clicked()
+                {
+                    clear_cache = true;
+                }
+                if ui
+                    .add(secondary_button(
+                        self.translator.text(keys::SETTINGS_CACHE_VACUUM),
+                        palette,
+                    ))
+                    .clicked()
+                {
+                    vacuum = true;
+                }
+            });
+        });
+        ui.add_space(12.0);
+        card(ui, palette, |ui| {
+            ui.label(
                 RichText::new(self.translator.text(keys::SETTINGS_PATHS))
                     .size(15.0)
                     .strong()
@@ -4603,6 +4681,30 @@ impl GitPanelApp {
         }
         if reload {
             self.reload_auth_action();
+        }
+        if clear_cache {
+            match self.db.clear_cache() {
+                Ok(_) => self.toast(
+                    self.translator.text(keys::SETTINGS_CACHE_CLEARED),
+                    ToastKind::Success,
+                ),
+                Err(error) => self.toast(
+                    format!("{}: {error}", self.translator.text(keys::ERROR_DB)),
+                    ToastKind::Error,
+                ),
+            }
+        }
+        if vacuum {
+            match self.db.vacuum() {
+                Ok(()) => self.toast(
+                    self.translator.text(keys::SETTINGS_CACHE_VACUUMED),
+                    ToastKind::Success,
+                ),
+                Err(error) => self.toast(
+                    format!("{}: {error}", self.translator.text(keys::ERROR_DB)),
+                    ToastKind::Error,
+                ),
+            }
         }
         if save {
             self.save_settings(form);
