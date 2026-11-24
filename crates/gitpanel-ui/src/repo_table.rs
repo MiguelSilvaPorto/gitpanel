@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use egui::{Align, Layout, Sense, Ui};
 use egui_extras::{Column, TableBuilder};
 use gitpanel_core::Repository;
@@ -15,6 +17,7 @@ pub fn repo_table(
     palette: Palette,
     selected: Option<i64>,
     syncing: Option<i64>,
+    avatars: &HashMap<String, egui::TextureHandle>,
 ) -> Option<i64> {
     let mut clicked = None;
     TableBuilder::new(ui)
@@ -86,7 +89,15 @@ pub fn repo_table(
                 row.set_selected(selected == Some(repository.github_id));
                 row.col(|ui| {
                     ui.horizontal(|ui| {
-                        icon(ui, Icon::Repo, 17.0, palette.fg_muted);
+                        if let Some(texture) = avatars.get(&repository.owner) {
+                            ui.add(
+                                egui::Image::from_texture(texture)
+                                    .fit_to_exact_size(egui::vec2(18.0, 18.0))
+                                    .corner_radius(9.0),
+                            );
+                        } else {
+                            icon(ui, Icon::Repo, 17.0, palette.fg_muted);
+                        }
                         ui.vertical(|ui| {
                             ui.horizontal(|ui| {
                                 ui.spacing_mut().item_spacing.x = 3.0;

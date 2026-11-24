@@ -664,6 +664,32 @@ impl GithubClient {
         Ok(text)
     }
 
+    pub async fn fetch_avatar(&self, login: &str) -> Result<Vec<u8>, GithubError> {
+        let url = format!("https://github.com/{login}.png?size=128");
+        let response = self
+            .http
+            .get(url)
+            .header(ACCEPT, "image/png,image/jpeg")
+            .send()
+            .await?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(GithubError::Http {
+                status: status.as_u16(),
+                message: format!("could not fetch avatar for {login}"),
+                request_id: None,
+            });
+        }
+        let bytes = response.bytes().await?;
+        if bytes.len() > 2_000_000 {
+            return Err(GithubError::Decode {
+                context: "avatar".to_owned(),
+                details: "image larger than 2 MB".to_owned(),
+            });
+        }
+        Ok(bytes.to_vec())
+    }
+
     fn contents_url(
         &self,
         owner: &str,

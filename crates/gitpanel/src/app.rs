@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
@@ -323,6 +323,9 @@ pub struct GitPanelApp {
     action_log_source: DataSource,
     action_log_pending: Option<Receiver<Result<(i64, String), GithubError>>>,
     action_log_error: Option<String>,
+    avatars: HashMap<String, egui::TextureHandle>,
+    avatar_pending: HashMap<String, Receiver<Result<Vec<u8>, GithubError>>>,
+    avatar_failed: HashSet<String>,
     markdown_cache: CommonMarkCache,
     diff_source: DiffSource,
     diff_state: DiffViewState,
@@ -475,6 +478,9 @@ impl GitPanelApp {
             action_log_source: DataSource::Remote,
             action_log_pending: None,
             action_log_error: None,
+            avatars: HashMap::new(),
+            avatar_pending: HashMap::new(),
+            avatar_failed: HashSet::new(),
             markdown_cache: CommonMarkCache::default(),
             diff_source: DiffSource::Commit,
             diff_state: DiffViewState::default(),
@@ -622,7 +628,109 @@ impl GitPanelApp {
         }
     }
 
-    fn poll_background(&mut self) {
+    fn avatar_cache_path(&self, login: &str) -> std::path::PathBuf {
+        self.config.paths.cache_dir.join("avatars").join(format!(
+            "{}.png",
+            login
+                .chars()
+                .map(
+                    |ch| if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+                        ch
+                    } else {
+                        '_'
+                    }
+                )
+                .collect::<String>()
+        ))
+    }
+
+    fn ensure_avatar(&mut self, ctx: &egui::Context, login: &str) {
+        if login.is_empty()
+            || self.avatars.contains_key(login)
+            || self.avatar_pending.contains_key(login)
+            || self.avatar_failed.contains(login)
+        {
+            return;
+        }
+        let path = self.avatar_cache_path(login);
+        if let Ok(bytes) = std::fs::read(&path)
+            && let Some(texture) = self.decode_avatar(ctx, login, &bytes)
+        {
+            self.avatars.insert(login.to_owned(), texture);
+            return;
+        }
+        let Some(client) = self.client.clone() else {
+            return;
+        };
+        let login_owned = login.to_owned();
+        let receiver = self
+            .jobs
+            .spawn(async move { client.fetch_avatar(&login_owned).await });
+        self.avatar_pending.insert(login.to_owned(), receiver);
+    }
+
+    fn ensure_visible_avatars(&mut self, ctx: &egui::Context) {
+        let mut logins = HashSet::new();
+        if let Some(account) = &self.account {
+            logins.insert(account.login.clone());
+        }
+        for repository in &self.repos {
+            logins.insert(repository.owner.clone());
+        }
+        for login in logins {
+            self.ensure_avatar(ctx, &login);
+        }
+    }
+
+    fn decode_avatar(
+        &self,
+        ctx: &egui::Context,
+        login: &str,
+        bytes: &[u8],
+    ) -> Option<egui::TextureHandle> {
+        let image = image::load_from_memory(bytes).ok()?;
+        let rgba = image.to_rgba8();
+        let size = [rgba.width() as usize, rgba.height() as usize];
+        let color_image = egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
+        Some(ctx.load_texture(
+            format!("github-avatar-{login}"),
+            color_image,
+            egui::TextureOptions::LINEAR,
+        ))
+    }
+
+    fn poll_avatars(&mut self, ctx: &egui::Context) {
+        let pending = std::mem::take(&mut self.avatar_pending);
+        for (login, receiver) in pending {
+            match receiver.try_recv() {
+                Ok(Ok(bytes)) => {
+                    if let Some(texture) = self.decode_avatar(ctx, &login, &bytes) {
+                        let path = self.avatar_cache_path(&login);
+                        if let Some(parent) = path.parent() {
+                            let _ = std::fs::create_dir_all(parent);
+                        }
+                        let _ = std::fs::write(path, &bytes);
+                        self.avatars.insert(login, texture);
+                    } else {
+                        self.avatar_failed.insert(login);
+                    }
+                }
+                Ok(Err(error)) => {
+                    tracing::debug!(%error, login, "could not load GitHub avatar");
+                    self.avatar_failed.insert(login);
+                }
+                Err(TryRecvError::Empty) => {
+                    self.avatar_pending.insert(login, receiver);
+                }
+                Err(TryRecvError::Disconnected) => {
+                    self.avatar_failed.insert(login);
+                }
+            }
+        }
+    }
+
+    fn poll_background(&mut self, ctx: &egui::Context) {
+        self.poll_avatars(ctx);
         if let Some(receiver) = self.account_pending.take() {
             match receiver.try_recv() {
                 Ok(Ok(account)) => {
@@ -2726,6 +2834,7 @@ impl GitPanelApp {
                     palette,
                     self.selected_repo_id,
                     self.sync_state.current_repo_id,
+                    &self.avatars,
                 ),
                 RepoView::Table => repo_table(
                     ui,
@@ -2734,6 +2843,7 @@ impl GitPanelApp {
                     palette,
                     self.selected_repo_id,
                     self.sync_state.current_repo_id,
+                    &self.avatars,
                 ),
             };
             if let Some(repo_id) = clicked {
@@ -5450,28 +5560,42 @@ impl GitPanelApp {
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if let Some(account) = &self.account {
-                            let (rect, response) = ui
-                                .allocate_exact_size(egui::Vec2::splat(28.0), egui::Sense::click());
-                            ui.painter().circle_filled(
-                                rect.center(),
-                                14.0,
-                                palette.accent_emphasis,
-                            );
-                            let initial = account
-                                .login
-                                .chars()
-                                .next()
-                                .unwrap_or('?')
-                                .to_ascii_uppercase();
-                            ui.painter().text(
-                                rect.center(),
-                                Align2::CENTER_CENTER,
-                                initial,
-                                FontId::proportional(12.0),
-                                Color32::WHITE,
-                            );
-                            if response.on_hover_text(&account.login).clicked() {
-                                go_settings = true;
+                            if let Some(texture) = self.avatars.get(&account.login) {
+                                let response = ui.add(
+                                    egui::Image::from_texture(texture)
+                                        .fit_to_exact_size(egui::Vec2::splat(28.0))
+                                        .corner_radius(14.0)
+                                        .sense(egui::Sense::click()),
+                                );
+                                if response.on_hover_text(&account.login).clicked() {
+                                    go_settings = true;
+                                }
+                            } else {
+                                let (rect, response) = ui.allocate_exact_size(
+                                    egui::Vec2::splat(28.0),
+                                    egui::Sense::click(),
+                                );
+                                ui.painter().circle_filled(
+                                    rect.center(),
+                                    14.0,
+                                    palette.accent_emphasis,
+                                );
+                                let initial = account
+                                    .login
+                                    .chars()
+                                    .next()
+                                    .unwrap_or('?')
+                                    .to_ascii_uppercase();
+                                ui.painter().text(
+                                    rect.center(),
+                                    Align2::CENTER_CENTER,
+                                    initial,
+                                    FontId::proportional(12.0),
+                                    Color32::WHITE,
+                                );
+                                if response.on_hover_text(&account.login).clicked() {
+                                    go_settings = true;
+                                }
                             }
                         } else {
                             icon(ui, Icon::Warning, 18.0, palette.attention_fg);
@@ -5563,7 +5687,8 @@ impl GitPanelApp {
 impl eframe::App for GitPanelApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
-        self.poll_background();
+        self.poll_background(&ctx);
+        self.ensure_visible_avatars(&ctx);
         self.rebuild_layout(&ctx);
         self.top_bar(ui);
         egui::CentralPanel::default()

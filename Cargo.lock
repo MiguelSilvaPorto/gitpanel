@@ -1292,6 +1292,7 @@ dependencies = [
  "gitpanel-metrics",
  "gitpanel-sync",
  "gitpanel-ui",
+ "image",
  "serde_json",
  "tokio",
  "tracing",
@@ -1865,6 +1866,8 @@ dependencies = [
  "num-traits",
  "png",
  "tiff",
+ "zune-core",
+ "zune-jpeg",
 ]
 
 [[package]]

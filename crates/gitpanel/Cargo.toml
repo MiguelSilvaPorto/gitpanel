@@ -25,6 +25,7 @@ gitpanel-i18n = { path = "../gitpanel-i18n" }
 gitpanel-metrics = { path = "../gitpanel-metrics" }
 gitpanel-sync = { path = "../gitpanel-sync" }
 gitpanel-ui = { path = "../gitpanel-ui" }
+image.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true

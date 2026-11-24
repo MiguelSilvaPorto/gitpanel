@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use egui::{
     Align, CornerRadius, Label, Layout, RichText, Sense, Stroke, StrokeKind, TextWrapMode, Ui,
     UiBuilder, vec2,
@@ -17,6 +19,7 @@ pub fn repo_grid(
     palette: Palette,
     selected: Option<i64>,
     syncing: Option<i64>,
+    avatars: &HashMap<String, egui::TextureHandle>,
 ) -> Option<i64> {
     let available = ui.available_width().max(280.0);
     let gap = 12.0;
@@ -28,7 +31,7 @@ pub fn repo_grid(
     ui.horizontal_wrapped(|ui| {
         for repository in repositories {
             if repository_card(
-                ui, repository, card_width, translator, palette, selected, syncing,
+                ui, repository, card_width, translator, palette, selected, syncing, avatars,
             ) {
                 clicked = Some(repository.github_id);
             }
@@ -46,6 +49,7 @@ fn repository_card(
     palette: Palette,
     selected: Option<i64>,
     syncing: Option<i64>,
+    avatars: &HashMap<String, egui::TextureHandle>,
 ) -> bool {
     let (rect, response) = ui.allocate_exact_size(vec2(width, 124.0), Sense::click());
     let is_selected = selected == Some(repository.github_id);
@@ -80,7 +84,15 @@ fn repository_card(
     child.spacing_mut().item_spacing.y = 4.0;
 
     child.horizontal(|ui| {
-        icon(ui, Icon::Repo, 18.0, palette.fg_muted);
+        if let Some(texture) = avatars.get(&repository.owner) {
+            ui.add(
+                egui::Image::from_texture(texture)
+                    .fit_to_exact_size(vec2(20.0, 20.0))
+                    .corner_radius(10.0),
+            );
+        } else {
+            icon(ui, Icon::Repo, 18.0, palette.fg_muted);
+        }
         ui.vertical(|ui| {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 3.0;
