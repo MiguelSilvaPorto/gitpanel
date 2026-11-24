@@ -11,12 +11,12 @@ use egui::{
 use gitpanel_config::{Config, ThemePreference};
 use gitpanel_core::{
     Account, Branch, Commit, CommitData, ContentPayload, CreateRepoRequest, FilePatch, Issue,
-    IssueComment, Label, PullRequest, RateLimit, Release, Repository, ValidationError, WorkflowJob,
-    WorkflowRun, validate_description, validate_repo_name,
+    IssueComment, Label, PullRequest, RateLimit, Release, RepoTree, Repository, ValidationError,
+    WorkflowJob, WorkflowRun, validate_description, validate_repo_name,
 };
 use gitpanel_db::Db;
 use gitpanel_diff::{Diff, Highlighter};
-use gitpanel_github::{GithubClient, GithubError};
+use gitpanel_github::{FileUpdate, GithubClient, GithubError};
 use gitpanel_i18n::{Arg, LanguagePreference, Translator, keys};
 use gitpanel_metrics::{Granularity, aggregate_local, summary, top_contributors};
 use gitpanel_sync::{SyncEvent, SyncHandle};
@@ -250,13 +250,13 @@ pub struct GitPanelApp {
     branches_pending: Option<Receiver<Result<Vec<Branch>, GithubError>>>,
     branches_source: DataSource,
     branches_error: Option<String>,
-    code_path: String,
-    contents: Option<ContentPayload>,
-    contents_repo: Option<i64>,
-    contents_branch: String,
-    contents_source: DataSource,
-    contents_pending: Option<Receiver<Result<ContentPayload, GithubError>>>,
-    contents_error: Option<String>,
+    tree: Option<RepoTree>,
+    tree_repo: Option<i64>,
+    tree_branch: String,
+    tree_source: DataSource,
+    tree_pending: Option<Receiver<Result<RepoTree, GithubError>>>,
+    tree_error: Option<String>,
+    code_dir_path: String,
     readme: Option<ContentPayload>,
     readme_repo: Option<i64>,
     readme_branch: String,
@@ -268,6 +268,11 @@ pub struct GitPanelApp {
     file_source: DataSource,
     file_pending: Option<Receiver<Result<ContentPayload, GithubError>>>,
     file_error: Option<String>,
+    code_editing: bool,
+    code_edit_buffer: String,
+    code_commit_message: String,
+    code_save_pending: Option<Receiver<Result<CommitData, GithubError>>>,
+    code_save_error: Option<String>,
     releases: Vec<Release>,
     releases_repo: Option<i64>,
     releases_source: DataSource,
@@ -405,13 +410,13 @@ impl GitPanelApp {
             branches_pending: None,
             branches_source: DataSource::Remote,
             branches_error: None,
-            code_path: String::new(),
-            contents: None,
-            contents_repo: None,
-            contents_branch: String::new(),
-            contents_source: DataSource::Remote,
-            contents_pending: None,
-            contents_error: None,
+            tree: None,
+            tree_repo: None,
+            tree_branch: String::new(),
+            tree_source: DataSource::Remote,
+            tree_pending: None,
+            tree_error: None,
+            code_dir_path: String::new(),
             readme: None,
             readme_repo: None,
             readme_branch: String::new(),
@@ -423,6 +428,11 @@ impl GitPanelApp {
             file_source: DataSource::Remote,
             file_pending: None,
             file_error: None,
+            code_editing: false,
+            code_edit_buffer: String::new(),
+            code_commit_message: String::new(),
+            code_save_pending: None,
+            code_save_error: None,
             releases: Vec::new(),
             releases_repo: None,
             releases_source: DataSource::Remote,
@@ -562,7 +572,15 @@ impl GitPanelApp {
                 _ => {}
             }
             #[cfg(debug_assertions)]
+            if let Ok(dir) = std::env::var("GITPANEL_OPEN_DIR") {
+                app.code_dir_path = dir;
+            }
+            #[cfg(debug_assertions)]
             if let Ok(path) = std::env::var("GITPANEL_OPEN_PATH") {
+                app.code_dir_path = path
+                    .rsplit_once('/')
+                    .map(|(parent, _)| parent.to_owned())
+                    .unwrap_or_default();
                 let branch = app.selected_branch.clone();
                 app.load_file(&repository, &branch, &path, false);
             }
@@ -1104,31 +1122,65 @@ impl GitPanelApp {
             }
         }
 
-        if let Some(receiver) = self.contents_pending.take() {
+        if let Some(receiver) = self.tree_pending.take() {
             match receiver.try_recv() {
-                Ok(Ok(payload)) => {
-                    if let (Some(repo_id), branch, path) = (
-                        self.contents_repo,
-                        self.contents_branch.clone(),
-                        payload.path.clone(),
-                    ) && let Ok(serialized) = serde_json::to_string(&payload)
+                Ok(Ok(tree)) => {
+                    if let (Some(repo_id), branch) = (self.tree_repo, self.tree_branch.clone())
+                        && let Ok(serialized) = serde_json::to_string(&tree)
                     {
-                        self.cache_content(repo_id, &branch, &path, &serialized);
+                        self.cache_content(repo_id, &branch, "__tree__", &serialized);
                     }
-                    self.contents = Some(payload);
-                    self.contents_source = DataSource::Local;
-                    self.contents_error = None;
-                    self.contents_pending = None;
+                    self.apply_tree(tree);
+                    self.tree_source = DataSource::Local;
+                    self.tree_error = None;
+                    self.tree_pending = None;
                 }
                 Ok(Err(error)) => {
-                    self.contents_source = DataSource::Remote;
-                    self.contents_error = Some(self.github_error_title(&error));
-                    self.contents_pending = None;
+                    self.tree_source = DataSource::Remote;
+                    self.tree_error = Some(self.github_error_title(&error));
+                    self.tree_pending = None;
                 }
-                Err(TryRecvError::Empty) => self.contents_pending = Some(receiver),
+                Err(TryRecvError::Empty) => self.tree_pending = Some(receiver),
                 Err(TryRecvError::Disconnected) => {
-                    self.contents_source = DataSource::Remote;
-                    self.contents_pending = None;
+                    self.tree_source = DataSource::Remote;
+                    self.tree_pending = None;
+                }
+            }
+        }
+
+        if let Some(receiver) = self.code_save_pending.take() {
+            match receiver.try_recv() {
+                Ok(Ok(_commit)) => {
+                    self.code_save_pending = None;
+                    self.code_save_error = None;
+                    self.code_editing = false;
+                    self.code_edit_buffer.clear();
+                    self.code_commit_message.clear();
+                    self.toast(
+                        self.translator.text(keys::CODE_COMMITTED),
+                        ToastKind::Success,
+                    );
+                    if let Some(repository) = self.selected_repository().cloned()
+                        && let Some(path) = self.code_file_path.clone()
+                    {
+                        self.load_file(&repository, &self.selected_branch.clone(), &path, true);
+                    }
+                }
+                Ok(Err(error)) => {
+                    let message = match &error {
+                        GithubError::Validation { .. } | GithubError::Http { status: 409, .. } => {
+                            self.translator.text(keys::CODE_EDIT_CONFLICT)
+                        }
+                        _ => self.github_error_title(&error),
+                    };
+                    self.code_save_error = Some(message.clone());
+                    self.code_save_pending = None;
+                    self.toast(message, ToastKind::Error);
+                }
+                Err(TryRecvError::Empty) => self.code_save_pending = Some(receiver),
+                Err(TryRecvError::Disconnected) => {
+                    self.code_save_error = Some(self.translator.text(keys::ERROR_GENERIC));
+                    self.code_save_pending = None;
                 }
             }
         }
@@ -1172,6 +1224,9 @@ impl GitPanelApp {
                     self.file_source = DataSource::Local;
                     self.file_error = None;
                     self.file_pending = None;
+                    if self.auto_edit_requested() {
+                        self.begin_edit();
+                    }
                 }
                 Ok(Err(error)) => {
                     self.file_source = DataSource::Remote;
@@ -1475,13 +1530,13 @@ impl GitPanelApp {
         self.branches_pending = None;
         self.branches_source = DataSource::Remote;
         self.branches_error = None;
-        self.code_path.clear();
-        self.contents = None;
-        self.contents_repo = None;
-        self.contents_branch.clear();
-        self.contents_source = DataSource::Remote;
-        self.contents_pending = None;
-        self.contents_error = None;
+        self.tree = None;
+        self.tree_repo = None;
+        self.tree_branch.clear();
+        self.tree_source = DataSource::Remote;
+        self.tree_pending = None;
+        self.tree_error = None;
+        self.code_dir_path.clear();
         self.readme = None;
         self.readme_repo = None;
         self.readme_branch.clear();
@@ -1493,6 +1548,11 @@ impl GitPanelApp {
         self.file_source = DataSource::Remote;
         self.file_pending = None;
         self.file_error = None;
+        self.code_editing = false;
+        self.code_edit_buffer.clear();
+        self.code_commit_message.clear();
+        self.code_save_pending = None;
+        self.code_save_error = None;
         self.releases.clear();
         self.releases_repo = None;
         self.releases_source = DataSource::Remote;
@@ -1736,11 +1796,13 @@ impl GitPanelApp {
         self.commits_branch.clear();
         self.commits_source = DataSource::Remote;
         self.commits_error = None;
-        self.contents = None;
-        self.contents_repo = None;
-        self.contents_branch.clear();
-        self.contents_source = DataSource::Remote;
-        self.contents_error = None;
+        self.tree = None;
+        self.tree_repo = None;
+        self.tree_branch.clear();
+        self.tree_source = DataSource::Remote;
+        self.tree_pending = None;
+        self.tree_error = None;
+        self.code_dir_path.clear();
         self.readme = None;
         self.readme_repo = None;
         self.readme_branch.clear();
@@ -1750,7 +1812,11 @@ impl GitPanelApp {
         self.code_file_path = None;
         self.file_source = DataSource::Remote;
         self.file_error = None;
-        self.code_path.clear();
+        self.code_editing = false;
+        self.code_edit_buffer.clear();
+        self.code_commit_message.clear();
+        self.code_save_pending = None;
+        self.code_save_error = None;
         self.load_commits(repository.github_id, branch);
     }
 
@@ -1841,12 +1907,12 @@ impl GitPanelApp {
         } else {
             self.selected_branch.clone()
         };
-        if (self.contents_repo != Some(repository.github_id)
-            || self.contents_branch != branch
-            || self.contents.is_none())
-            && self.contents_pending.is_none()
+        if (self.tree_repo != Some(repository.github_id)
+            || self.tree_branch != branch
+            || (self.tree.is_none() && self.tree_error.is_none()))
+            && self.tree_pending.is_none()
         {
-            self.load_contents(repository, &branch, &self.code_path.clone(), false);
+            self.load_tree(repository, &branch, false);
         }
         if (self.readme_repo != Some(repository.github_id) || self.readme_branch != branch)
             && self.readme_pending.is_none()
@@ -1855,53 +1921,69 @@ impl GitPanelApp {
         }
     }
 
-    fn load_contents(&mut self, repository: &Repository, branch: &str, path: &str, refresh: bool) {
-        if self.contents_pending.is_some() {
+    fn load_tree(&mut self, repository: &Repository, branch: &str, refresh: bool) {
+        if self.tree_pending.is_some() {
             return;
         }
-        if !refresh
-            && self.contents_error.is_some()
-            && self.contents_repo == Some(repository.github_id)
-            && self.contents_branch == branch
-            && self.code_path == path
-        {
+        let same_branch =
+            self.tree_repo == Some(repository.github_id) && self.tree_branch == branch;
+        if !refresh && same_branch && (self.tree.is_some() || self.tree_error.is_some()) {
             return;
         }
-        self.code_path = path.to_owned();
-        self.code_file = None;
-        self.code_file_path = None;
-        self.file_source = DataSource::Remote;
-        self.file_error = None;
+        if !same_branch {
+            self.tree = None;
+            self.code_dir_path.clear();
+            self.code_file = None;
+            self.code_file_path = None;
+            self.file_pending = None;
+            self.file_error = None;
+            self.code_editing = false;
+            self.code_edit_buffer.clear();
+            self.code_commit_message.clear();
+            self.code_save_pending = None;
+            self.code_save_error = None;
+        }
         if !refresh
-            && let Some(payload) = self
+            && let Some(cached) = self
                 .db
-                .get_content_cache(repository.github_id, branch, path)
+                .get_content_cache(repository.github_id, branch, "__tree__")
                 .ok()
                 .flatten()
-                .and_then(|value| serde_json::from_str::<ContentPayload>(&value).ok())
+            && let Ok(tree) = serde_json::from_str::<RepoTree>(&cached)
         {
-            self.contents = Some(payload);
-            self.contents_repo = Some(repository.github_id);
-            self.contents_branch = branch.to_owned();
-            self.contents_source = DataSource::Local;
-            self.contents_error = None;
+            self.tree_repo = Some(repository.github_id);
+            self.tree_branch = branch.to_owned();
+            self.tree_source = DataSource::Local;
+            self.tree_error = None;
+            self.apply_tree(tree);
             return;
         }
         let Some(client) = self.client.clone() else {
             return;
         };
-        self.contents_repo = Some(repository.github_id);
-        self.contents_branch = branch.to_owned();
-        self.contents_source = DataSource::Loading;
-        self.contents_error = None;
+        self.tree_repo = Some(repository.github_id);
+        self.tree_branch = branch.to_owned();
+        self.tree_source = DataSource::Loading;
+        self.tree_error = None;
+        let reference = if branch.contains('/') {
+            self.branches
+                .iter()
+                .find(|candidate| candidate.name == branch)
+                .map(|candidate| candidate.sha.clone())
+                .unwrap_or_else(|| branch.to_owned())
+        } else {
+            branch.to_owned()
+        };
         let owner = repository.owner.clone();
         let name = repository.name.clone();
-        let path = path.to_owned();
-        let branch = branch.to_owned();
-        self.contents_pending = Some(
+        self.tree_pending = Some(
             self.jobs
-                .spawn(async move { client.get_contents(&owner, &name, &path, &branch).await }),
+                .spawn(async move { client.get_tree(&owner, &name, &reference).await }),
         );
+    }
+
+    fn apply_tree(&mut self, tree: RepoTree) {
+        self.tree = Some(tree);
     }
 
     fn load_readme(&mut self, repository: &Repository, branch: &str, refresh: bool) {
@@ -1955,6 +2037,9 @@ impl GitPanelApp {
             self.code_file = Some(payload);
             self.file_source = DataSource::Local;
             self.file_error = None;
+            if self.auto_edit_requested() {
+                self.begin_edit();
+            }
             return;
         }
         let Some(client) = self.client.clone() else {
@@ -3066,7 +3151,7 @@ impl GitPanelApp {
                     .color(palette.fg_muted),
             );
             branch_changed = self.branch_combo(ui, repository);
-            source_badge(ui, self.contents_source, &self.translator, palette);
+            source_badge(ui, self.tree_source, &self.translator, palette);
             if ui
                 .add(secondary_button(
                     self.translator.text(keys::CODE_REFRESH),
@@ -3084,210 +3169,338 @@ impl GitPanelApp {
             error_banner(ui, &self.translator.text(keys::ERROR_SYNC), error, palette);
         }
         if refresh {
-            self.load_contents(
-                repository,
-                &self.selected_branch.clone(),
-                &self.code_path.clone(),
-                true,
-            );
-            self.load_readme(repository, &self.selected_branch.clone(), true);
+            let branch = self.selected_branch.clone();
+            self.load_tree(repository, &branch, true);
+            self.load_readme(repository, &branch, true);
+            if let Some(path) = self.code_file_path.clone() {
+                self.load_file(repository, &branch, &path, true);
+            }
         }
 
+        ui.add_space(8.0);
+        if self.code_file_path.is_some() {
+            self.code_file_view(ui, repository);
+        } else {
+            self.tree_box(ui, repository);
+            if self.code_dir_path.is_empty()
+                && let Some(readme) = self.readme.clone()
+            {
+                ui.add_space(12.0);
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(self.translator.text(keys::CODE_README))
+                            .size(14.0)
+                            .strong()
+                            .color(palette.fg_default),
+                    );
+                    source_badge(ui, self.readme_source, &self.translator, palette);
+                });
+                ui.add_space(4.0);
+                if let Some(content) = &readme.content {
+                    markdown(ui, &mut self.markdown_cache, content);
+                } else if readme.binary {
+                    info_banner(ui, &self.translator.text(keys::CODE_BINARY), palette);
+                } else if readme.truncated {
+                    info_banner(ui, &self.translator.text(keys::CODE_TOO_LARGE), palette);
+                }
+            }
+        }
+    }
+
+    fn tree_box(&mut self, ui: &mut Ui, repository: &Repository) {
+        let palette = self.theme.palette;
+        let current_dir = self.code_dir_path.clone();
+        let mut go_root = false;
+        let mut go_up = false;
         let mut navigate = None;
-        if !self.code_path.is_empty() {
-            ui.horizontal_wrapped(|ui| {
-                if ui
-                    .add(
-                        egui::Button::new(
-                            RichText::new(self.translator.text(keys::CODE_ROOT))
-                                .size(12.0)
-                                .color(palette.accent_fg),
-                        )
-                        .frame(false),
-                    )
-                    .clicked()
-                {
-                    navigate = Some(String::new());
-                }
-                let parts: Vec<String> = self
-                    .code_path
-                    .split('/')
-                    .filter(|part| !part.is_empty())
-                    .map(str::to_owned)
-                    .collect();
-                let mut accumulated = String::new();
-                for part in parts {
-                    if !accumulated.is_empty() {
-                        ui.label(RichText::new("/").color(palette.fg_subtle));
-                    }
-                    accumulated.push_str(&part);
-                    if ui
-                        .add(
-                            egui::Button::new(
-                                RichText::new(&part).size(12.0).color(palette.accent_fg),
-                            )
-                            .frame(false),
-                        )
-                        .clicked()
-                    {
-                        navigate = Some(accumulated.clone());
-                    }
-                    accumulated.push('/');
-                }
-            });
-            ui.add_space(4.0);
-        }
-
         let mut open_file = None;
-        if self.contents_pending.is_some() {
-            loading(ui, &self.translator.text(keys::CODE_LOADING), palette);
-        } else if let Some(error) = &self.contents_error {
-            error_banner(
-                ui,
-                &self.translator.text(keys::ERROR_GENERIC),
-                error,
-                palette,
-            );
-        } else if let Some(payload) = &self.contents {
-            if payload.is_dir() {
-                let mut entries = payload.entries.clone();
-                entries.sort_by_key(|entry| (entry.kind != "dir", entry.name.to_ascii_lowercase()));
-                if entries.is_empty() {
-                    muted(ui, self.translator.text(keys::CODE_EMPTY), palette);
-                } else {
-                    ScrollArea::vertical()
-                        .id_salt((
-                            "code-directory",
-                            repository.github_id,
-                            self.code_path.clone(),
-                        ))
-                        .max_height(280.0)
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            let repo_id = repository.github_id;
-                            let branch = self.selected_branch.clone();
-                            for entry in entries {
-                                let cached = self
-                                    .db
-                                    .get_content_cache(repo_id, &branch, &entry.path)
-                                    .ok()
-                                    .flatten()
-                                    .is_some();
-                                ui.horizontal(|ui| {
-                                    icon(
-                                        ui,
-                                        if entry.kind == "dir" {
-                                            Icon::Folder
-                                        } else {
-                                            Icon::File
-                                        },
-                                        15.0,
-                                        palette.fg_muted,
-                                    );
-                                    let response = ui.add(
-                                        egui::Button::new(
-                                            RichText::new(&entry.name).size(12.0).color(
-                                                if entry.kind == "dir" {
-                                                    palette.accent_fg
-                                                } else {
-                                                    palette.fg_default
-                                                },
-                                            ),
-                                        )
+        Frame::NONE
+            .fill(palette.canvas_subtle)
+            .stroke(Stroke::new(2.0, palette.accent_emphasis))
+            .corner_radius(egui::CornerRadius::same(12))
+            .inner_margin(Margin::same(1))
+            .show(ui, |ui| {
+                Frame::NONE
+                    .fill(palette.canvas_default)
+                    .corner_radius(egui::CornerRadius::same(11))
+                    .inner_margin(Margin::same(14))
+                    .show(ui, |ui| {
+                        let box_width = ui.available_width();
+                        ui.set_min_width(box_width);
+                        ui.set_max_width(box_width);
+                        let entries = self
+                            .tree
+                            .as_ref()
+                            .map(|tree| dir_entries(tree, &current_dir));
+                        let files = entries
+                            .as_ref()
+                            .map(|entries| {
+                                entries.iter().filter(|entry| entry.kind == "file").count()
+                            })
+                            .unwrap_or(0);
+                        let dirs = entries
+                            .as_ref()
+                            .map(|entries| {
+                                entries.iter().filter(|entry| entry.kind == "dir").count()
+                            })
+                            .unwrap_or(0);
+                        let truncated = self.tree.as_ref().is_some_and(|tree| tree.truncated);
+
+                        ui.horizontal(|ui| {
+                            icon(ui, Icon::Folder, 20.0, palette.accent_fg);
+                            ui.label(
+                                RichText::new(self.translator.text(keys::CODE_FILES_TITLE))
+                                    .size(16.0)
+                                    .strong()
+                                    .color(palette.fg_default),
+                            );
+                            if entries.is_some() {
+                                badge(
+                                    ui,
+                                    self.translator.text_args(
+                                        keys::CODE_FILES_SUMMARY,
+                                        &[
+                                            Arg::int("files", files as i64),
+                                            Arg::int("dirs", dirs as i64),
+                                        ],
+                                    ),
+                                    palette.canvas_inset,
+                                    palette.fg_muted,
+                                );
+                            }
+                            if truncated {
+                                badge(
+                                    ui,
+                                    self.translator.text(keys::CODE_TREE_PARTIAL),
+                                    palette.diff_del_bg,
+                                    palette.attention_fg,
+                                );
+                            }
+                            source_badge(ui, self.tree_source, &self.translator, palette);
+                        });
+
+                        ui.add_space(6.0);
+                        ui.horizontal_wrapped(|ui| {
+                            if ui
+                                .add(
+                                    egui::Button::new(
+                                        RichText::new(self.translator.text(keys::CODE_ROOT))
+                                            .size(11.5)
+                                            .color(if current_dir.is_empty() {
+                                                palette.fg_default
+                                            } else {
+                                                palette.accent_fg
+                                            }),
+                                    )
+                                    .frame(false),
+                                )
+                                .clicked()
+                            {
+                                go_root = true;
+                            }
+                            let parts: Vec<&str> = current_dir
+                                .split('/')
+                                .filter(|part| !part.is_empty())
+                                .collect();
+                            let mut accumulated = String::new();
+                            for (index, part) in parts.iter().enumerate() {
+                                ui.label(RichText::new("/").color(palette.fg_subtle));
+                                accumulated.push_str(part);
+                                let is_last = index + 1 == parts.len();
+                                if ui
+                                    .add(
+                                        egui::Button::new(RichText::new(*part).size(11.5).color(
+                                            if is_last {
+                                                palette.fg_default
+                                            } else {
+                                                palette.accent_fg
+                                            },
+                                        ))
                                         .frame(false),
-                                    );
+                                    )
+                                    .clicked()
+                                {
+                                    navigate = Some(accumulated.clone());
+                                }
+                                accumulated.push('/');
+                            }
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if !current_dir.is_empty()
+                                    && ui
+                                        .add(
+                                            egui::Button::new(
+                                                RichText::new(format!(
+                                                    "← {}",
+                                                    self.translator.text(keys::CODE_UP)
+                                                ))
+                                                .size(11.0)
+                                                .color(palette.accent_fg),
+                                            )
+                                            .frame(false),
+                                        )
+                                        .clicked()
+                                {
+                                    go_up = true;
+                                }
+                            });
+                        });
+                        ui.add_space(8.0);
+                        ui.separator();
+                        ui.add_space(4.0);
+
+                        if self.tree_pending.is_some() {
+                            loading(ui, &self.translator.text(keys::CODE_LOADING), palette);
+                        } else if let Some(error) = &self.tree_error {
+                            error_banner(
+                                ui,
+                                &self.translator.text(keys::ERROR_GENERIC),
+                                error,
+                                palette,
+                            );
+                        } else if let Some(entries) = &entries {
+                            if entries.is_empty() {
+                                muted(ui, self.translator.text(keys::CODE_EMPTY), palette);
+                            } else {
+                                for entry in entries {
+                                    let is_dir = entry.kind == "dir";
+                                    let selected = !is_dir
+                                        && self.code_file_path.as_deref()
+                                            == Some(entry.path.as_str());
+                                    let row_width = ui.available_width();
+                                    let response = Frame::NONE
+                                        .fill(if selected {
+                                            palette.selection_bg
+                                        } else {
+                                            Color32::TRANSPARENT
+                                        })
+                                        .corner_radius(egui::CornerRadius::same(5))
+                                        .inner_margin(Margin::symmetric(6, 3))
+                                        .show(ui, |ui| {
+                                            let row_content_width = (row_width - 12.0).max(80.0);
+                                            ui.set_min_width(row_content_width);
+                                            ui.set_max_width(row_content_width);
+                                            ui.horizontal(|ui| {
+                                                icon(
+                                                    ui,
+                                                    if is_dir { Icon::Folder } else { Icon::File },
+                                                    16.0,
+                                                    if is_dir {
+                                                        palette.accent_fg
+                                                    } else {
+                                                        palette.fg_muted
+                                                    },
+                                                );
+                                                let name_width =
+                                                    (row_content_width - 110.0).max(60.0);
+                                                ui.allocate_ui_with_layout(
+                                                    egui::vec2(name_width, 18.0),
+                                                    Layout::left_to_right(Align::Center),
+                                                    |ui| {
+                                                        ui.add(
+                                                            egui::Label::new(
+                                                                RichText::new(&entry.name)
+                                                                    .size(12.0)
+                                                                    .color(if is_dir {
+                                                                        palette.accent_fg
+                                                                    } else if selected {
+                                                                        palette.fg_default
+                                                                    } else {
+                                                                        palette.fg_muted
+                                                                    }),
+                                                            )
+                                                            .truncate(),
+                                                        );
+                                                    },
+                                                );
+                                                ui.with_layout(
+                                                    Layout::right_to_left(Align::Center),
+                                                    |ui| {
+                                                        if is_dir {
+                                                            ui.label(
+                                                                RichText::new("›")
+                                                                    .size(15.0)
+                                                                    .color(palette.fg_subtle),
+                                                            );
+                                                        } else if let Some(size) = entry.size {
+                                                            ui.label(
+                                                                RichText::new(format_bytes(size))
+                                                                    .size(10.5)
+                                                                    .color(palette.fg_subtle),
+                                                            );
+                                                        }
+                                                    },
+                                                );
+                                            });
+                                        })
+                                        .response
+                                        .interact(egui::Sense::click())
+                                        .on_hover_text(&entry.path);
+                                    if response.hovered() {
+                                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                                    }
                                     if response.clicked() {
-                                        if entry.kind == "dir" {
+                                        if is_dir {
                                             navigate = Some(entry.path.clone());
                                         } else {
                                             open_file = Some(entry.path.clone());
                                         }
                                     }
-                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                        if let Some(url) = &entry.html_url
-                                            && ui
-                                                .add(
-                                                    egui::Button::new(
-                                                        RichText::new("↗")
-                                                            .size(11.0)
-                                                            .color(palette.fg_subtle),
-                                                    )
-                                                    .frame(false),
-                                                )
-                                                .clicked()
-                                        {
-                                            ui.ctx().open_url(egui::OpenUrl::new_tab(url.clone()));
-                                        }
-                                        icon(
-                                            ui,
-                                            if cached { Icon::Local } else { Icon::Cloud },
-                                            11.0,
-                                            if cached {
-                                                palette.success_fg
-                                            } else {
-                                                palette.fg_subtle
-                                            },
-                                        );
-                                        if entry.kind != "dir"
-                                            && let Some(size) = entry.size
-                                        {
-                                            ui.label(
-                                                RichText::new(format_bytes(size))
-                                                    .size(10.5)
-                                                    .color(palette.fg_subtle),
-                                            );
-                                        }
-                                    });
-                                });
-                                ui.separator();
+                                }
                             }
-                        });
-                }
-            } else if let Some(content) = &payload.content {
-                ui.add(
-                    egui::Label::new(
-                        RichText::new(content)
-                            .monospace()
-                            .size(11.5)
-                            .color(palette.fg_default),
-                    )
-                    .wrap_mode(egui::TextWrapMode::Extend),
-                );
-            }
-        }
+                            if truncated {
+                                ui.add_space(6.0);
+                                info_banner(
+                                    ui,
+                                    &self.translator.text(keys::CODE_TREE_TRUNCATED),
+                                    palette,
+                                );
+                            }
+                        } else {
+                            loading(ui, &self.translator.text(keys::CODE_LOADING), palette);
+                        }
+                    });
+            });
 
+        if go_root {
+            self.code_dir_path.clear();
+            self.close_code_file();
+        }
+        if go_up {
+            self.code_dir_path = current_dir
+                .rsplit_once('/')
+                .map(|(parent, _)| parent.to_owned())
+                .unwrap_or_default();
+            self.close_code_file();
+        }
+        if let Some(path) = navigate
+            && path != current_dir
+        {
+            self.code_dir_path = path;
+            self.close_code_file();
+        }
         if let Some(path) = open_file {
+            self.code_dir_path = path
+                .rsplit_once('/')
+                .map(|(parent, _)| parent.to_owned())
+                .unwrap_or_default();
+            self.close_code_file();
             self.load_file(repository, &self.selected_branch.clone(), &path, false);
         }
-        if let Some(path) = navigate {
-            self.load_contents(repository, &self.selected_branch.clone(), &path, false);
-        }
+    }
 
-        self.code_file_view(ui, repository);
-
-        if self.code_path.is_empty()
-            && let Some(readme) = self.readme.clone()
-        {
-            ui.add_space(12.0);
-            ui.separator();
-            ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new(self.translator.text(keys::CODE_README))
-                        .size(14.0)
-                        .strong()
-                        .color(palette.fg_default),
-                );
-                source_badge(ui, self.readme_source, &self.translator, palette);
-            });
-            ui.add_space(4.0);
-            if let Some(content) = &readme.content {
-                markdown(ui, &mut self.markdown_cache, content);
-            } else if readme.binary {
-                info_banner(ui, &self.translator.text(keys::CODE_BINARY), palette);
-            } else if readme.truncated {
-                info_banner(ui, &self.translator.text(keys::CODE_TOO_LARGE), palette);
-            }
-        }
+    fn close_code_file(&mut self) {
+        self.scroll_generation = self.scroll_generation.wrapping_add(1);
+        self.code_file = None;
+        self.code_file_path = None;
+        self.file_source = DataSource::Remote;
+        self.file_pending = None;
+        self.file_error = None;
+        self.code_editing = false;
+        self.code_edit_buffer.clear();
+        self.code_commit_message.clear();
+        self.code_save_pending = None;
+        self.code_save_error = None;
     }
 
     fn code_file_view(&mut self, ui: &mut Ui, repository: &Repository) {
@@ -3295,82 +3508,351 @@ impl GitPanelApp {
             return;
         };
         let palette = self.theme.palette;
-        ui.add_space(10.0);
-        ui.separator();
-        ui.horizontal_wrapped(|ui| {
-            icon(ui, Icon::File, 15.0, palette.fg_muted);
-            ui.label(
-                RichText::new(&path)
-                    .monospace()
-                    .size(12.0)
-                    .strong()
-                    .color(palette.fg_default),
-            );
-            source_badge(ui, self.file_source, &self.translator, palette);
-            if let Some(file) = &self.code_file
-                && let Some(url) = &file.html_url
-                && ui
-                    .add(
-                        egui::Button::new(
-                            RichText::new(self.translator.text(keys::COMMON_OPEN_GITHUB))
-                                .size(11.0)
-                                .color(palette.accent_fg),
-                        )
-                        .frame(false),
-                    )
-                    .clicked()
+        let branch = self.selected_branch.clone();
+        let file_source = self.file_source;
+        let file_pending = self.file_pending.is_some();
+        let file_error = self.file_error.clone();
+        let editing = self.code_editing;
+        let save_pending = self.code_save_pending.is_some();
+        let save_error = self.code_save_error.clone();
+        let archived = repository.archived;
+        let file = self.code_file.as_ref();
+        let edit_buffer = &mut self.code_edit_buffer;
+        let commit_message = &mut self.code_commit_message;
+        let translator = &self.translator;
+        let can_edit = if let Some(file) = file {
+            !archived
+                && !file.binary
+                && !file.truncated
+                && file.sha.is_some()
+                && file
+                    .content
+                    .as_ref()
+                    .is_some_and(|content| content.chars().count() <= 200_000)
+        } else {
+            false
+        };
+        let mut close = false;
+        let mut start_edit = false;
+        let mut cancel = false;
+        let mut save = false;
+
+        ui.add_space(12.0);
+        Frame::NONE
+            .fill(palette.canvas_subtle)
+            .stroke(Stroke::new(2.0, palette.accent_emphasis))
+            .corner_radius(egui::CornerRadius::same(12))
+            .inner_margin(Margin::same(1))
+            .show(ui, |ui| {
+                Frame::NONE
+                    .fill(palette.canvas_default)
+                    .corner_radius(egui::CornerRadius::same(11))
+                    .inner_margin(Margin::same(14))
+                    .show(ui, |ui| {
+                        let box_width = ui.available_width();
+                        ui.set_min_width(box_width);
+                        ui.set_max_width(box_width);
+                        ui.horizontal_wrapped(|ui| {
+                            if ui
+                                .add(
+                                    egui::Button::new(
+                                        RichText::new(format!(
+                                            "← {}",
+                                            translator.text(keys::COMMON_BACK)
+                                        ))
+                                        .size(11.0)
+                                        .color(palette.accent_fg),
+                                    )
+                                    .frame(false),
+                                )
+                                .clicked()
+                            {
+                                close = true;
+                            }
+                            icon(ui, Icon::File, 17.0, palette.accent_fg);
+                            ui.label(
+                                RichText::new(&path)
+                                    .monospace()
+                                    .size(12.5)
+                                    .strong()
+                                    .color(palette.fg_default),
+                            );
+                            source_badge(ui, file_source, translator, palette);
+                            badge(
+                                ui,
+                                translator.text(if editing {
+                                    keys::CODE_EDITING_MODE
+                                } else {
+                                    keys::CODE_READ_ONLY
+                                }),
+                                if editing {
+                                    palette.selection_bg
+                                } else {
+                                    palette.canvas_inset
+                                },
+                                if editing {
+                                    palette.accent_fg
+                                } else {
+                                    palette.fg_muted
+                                },
+                            );
+                            if let Some(file) = file {
+                                if let Some(size) = file.size {
+                                    ui.label(
+                                        RichText::new(format_bytes(size))
+                                            .size(10.5)
+                                            .color(palette.fg_subtle),
+                                    );
+                                }
+                                if let Some(url) = &file.html_url
+                                    && ui
+                                        .add(
+                                            egui::Button::new(
+                                                RichText::new(
+                                                    translator.text(keys::COMMON_OPEN_GITHUB),
+                                                )
+                                                .size(11.0)
+                                                .color(palette.accent_fg),
+                                            )
+                                            .frame(false),
+                                        )
+                                        .clicked()
+                                {
+                                    ui.ctx().open_url(egui::OpenUrl::new_tab(url.clone()));
+                                }
+                            }
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if can_edit
+                                    && !editing
+                                    && icon_button(
+                                        ui,
+                                        Icon::Pencil,
+                                        &translator.text(keys::CODE_EDIT),
+                                    )
+                                    .clicked()
+                                {
+                                    start_edit = true;
+                                }
+                                if ui
+                                    .add(
+                                        egui::Button::new(
+                                            RichText::new("✕").size(13.0).color(palette.fg_muted),
+                                        )
+                                        .frame(false),
+                                    )
+                                    .on_hover_text(translator.text(keys::CODE_CLOSE_VIEWER))
+                                    .clicked()
+                                {
+                                    close = true;
+                                }
+                            });
+                        });
+                        ui.add_space(6.0);
+                        ui.separator();
+
+                        if file_pending {
+                            loading(ui, &translator.text(keys::CODE_FILE_LOADING), palette);
+                            return;
+                        }
+                        if let Some(error) = &file_error {
+                            error_banner(ui, &translator.text(keys::ERROR_GENERIC), error, palette);
+                            return;
+                        }
+                        if let Some(error) = &save_error {
+                            error_banner(ui, &translator.text(keys::ERROR_GENERIC), error, palette);
+                        }
+                        let Some(file) = file else {
+                            loading(ui, &translator.text(keys::CODE_FILE_LOADING), palette);
+                            return;
+                        };
+                        if file.binary {
+                            info_banner(ui, &translator.text(keys::CODE_BINARY), palette);
+                            return;
+                        }
+                        if file.truncated {
+                            info_banner(ui, &translator.text(keys::CODE_TOO_LARGE), palette);
+                            return;
+                        }
+                        if editing {
+                            ui.add_space(8.0);
+                            ui.label(
+                                RichText::new(translator.text(keys::CODE_COMMIT_MESSAGE))
+                                    .size(11.5)
+                                    .color(palette.fg_muted),
+                            );
+                            ui.add(
+                                egui::TextEdit::singleline(commit_message)
+                                    .hint_text(translator.text(keys::CODE_COMMIT_PLACEHOLDER))
+                                    .desired_width(f32::INFINITY)
+                                    .font(egui::TextStyle::Monospace),
+                            );
+                            ui.add_space(8.0);
+                            ui.horizontal(|ui| {
+                                if save_pending {
+                                    loading(ui, &translator.text(keys::COMMON_LOADING), palette);
+                                } else {
+                                    if ui
+                                        .add_enabled(
+                                            !commit_message.trim().is_empty(),
+                                            primary_button(
+                                                translator.text(keys::CODE_SAVE_COMMIT),
+                                                palette,
+                                            ),
+                                        )
+                                        .clicked()
+                                    {
+                                        save = true;
+                                    }
+                                    if ui
+                                        .add(secondary_button(
+                                            translator.text(keys::CODE_CANCEL_EDIT),
+                                            palette,
+                                        ))
+                                        .clicked()
+                                    {
+                                        cancel = true;
+                                    }
+                                }
+                            });
+                            ui.add_space(8.0);
+                            ui.separator();
+                            ui.add_space(4.0);
+                            ui.add(
+                                egui::TextEdit::multiline(edit_buffer)
+                                    .id_salt(("code-editor", repository.github_id, path.as_str()))
+                                    .code_editor()
+                                    .desired_width(f32::INFINITY)
+                                    .desired_rows(20),
+                            );
+                        } else if let Some(content) = &file.content {
+                            const PREVIEW_LIMIT: usize = 50_000;
+                            let total = content.chars().count();
+                            let preview = if total > PREVIEW_LIMIT {
+                                content.chars().take(PREVIEW_LIMIT).collect::<String>()
+                            } else {
+                                content.clone()
+                            };
+                            ScrollArea::horizontal()
+                                .id_salt(("code-file", repository.github_id, path.as_str()))
+                                .auto_shrink([false, true])
+                                .show(ui, |ui| {
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(preview)
+                                                .monospace()
+                                                .size(11.0)
+                                                .color(palette.fg_default),
+                                        )
+                                        .wrap_mode(egui::TextWrapMode::Extend),
+                                    );
+                                });
+                            if total > PREVIEW_LIMIT {
+                                ui.add_space(6.0);
+                                info_banner(
+                                    ui,
+                                    &translator.text(keys::CODE_VIEW_TRUNCATED),
+                                    palette,
+                                );
+                            }
+                        } else {
+                            muted(ui, translator.text(keys::CODE_EMPTY), palette);
+                        }
+                    });
+            });
+
+        if close {
+            self.close_code_file();
+        }
+        if start_edit {
+            self.begin_edit();
+        }
+        if cancel {
+            self.code_editing = false;
+            self.code_edit_buffer.clear();
+            self.code_commit_message.clear();
+            self.code_save_error = None;
+        }
+        if save {
+            let sha = self.code_file.as_ref().and_then(|file| file.sha.clone());
+            let content = self.code_edit_buffer.clone();
+            let message = self.code_commit_message.trim().to_owned();
+            if !message.is_empty()
+                && let Some(sha) = sha
             {
-                ui.ctx().open_url(egui::OpenUrl::new_tab(url.clone()));
+                self.save_file(repository, &path, &branch, &content, &message, &sha);
             }
-        });
-        if self.file_pending.is_some() {
-            loading(ui, &self.translator.text(keys::CODE_FILE_LOADING), palette);
-            return;
         }
-        if let Some(error) = &self.file_error {
-            error_banner(
-                ui,
-                &self.translator.text(keys::ERROR_GENERIC),
-                error,
-                palette,
-            );
-            return;
-        }
+    }
+
+    fn begin_edit(&mut self) {
         let Some(file) = &self.code_file else {
+            self.code_save_error = Some(self.translator.text(keys::CODE_EDIT_UNAVAILABLE));
             return;
         };
-        if file.binary {
-            info_banner(ui, &self.translator.text(keys::CODE_BINARY), palette);
+        if file.binary || file.truncated || file.sha.is_none() {
+            self.code_save_error = Some(self.translator.text(keys::CODE_EDIT_UNAVAILABLE));
             return;
         }
-        if file.truncated {
-            info_banner(ui, &self.translator.text(keys::CODE_TOO_LARGE), palette);
+        let Some(content) = file.content.clone() else {
+            self.code_save_error = Some(self.translator.text(keys::CODE_EDIT_UNAVAILABLE));
+            return;
+        };
+        let path = self.code_file_path.clone().unwrap_or_default();
+        self.code_edit_buffer = content;
+        self.code_commit_message = self
+            .translator
+            .text_args(keys::CODE_COMMIT_DEFAULT, &[Arg::str("path", &path)]);
+        self.code_editing = true;
+        self.code_save_error = None;
+    }
+
+    fn auto_edit_requested(&self) -> bool {
+        #[cfg(debug_assertions)]
+        {
+            std::env::var_os("GITPANEL_OPEN_EDIT").is_some()
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            false
+        }
+    }
+
+    fn save_file(
+        &mut self,
+        repository: &Repository,
+        path: &str,
+        branch: &str,
+        content: &str,
+        message: &str,
+        sha: &str,
+    ) {
+        if self.code_save_pending.is_some() {
             return;
         }
-        if let Some(content) = &file.content {
-            let content = if content.chars().count() > 50_000 {
-                content.chars().take(50_000).collect::<String>()
-            } else {
-                content.clone()
-            };
-            ScrollArea::both()
-                .id_salt(("code-file", repository.github_id, path))
-                .max_height(340.0)
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    ui.add(
-                        egui::Label::new(
-                            RichText::new(content)
-                                .monospace()
-                                .size(11.0)
-                                .color(palette.fg_default),
-                        )
-                        .wrap_mode(egui::TextWrapMode::Extend),
-                    );
-                });
-        } else {
-            muted(ui, self.translator.text(keys::CODE_EMPTY), palette);
-        }
+        let Some(client) = self.client.clone() else {
+            return;
+        };
+        self.code_save_error = None;
+        let owner = repository.owner.clone();
+        let name = repository.name.clone();
+        let path = path.to_owned();
+        let branch = branch.to_owned();
+        let content = content.to_owned();
+        let message = message.to_owned();
+        let sha = sha.to_owned();
+        self.code_save_pending = Some(self.jobs.spawn(async move {
+            client
+                .update_file(FileUpdate {
+                    owner: &owner,
+                    repo: &name,
+                    path: &path,
+                    branch: &branch,
+                    content: &content,
+                    message: &message,
+                    sha: &sha,
+                })
+                .await
+        }));
     }
 
     fn branches_panel(&mut self, ui: &mut Ui, repository: &Repository) {
@@ -5728,6 +6210,30 @@ impl eframe::App for GitPanelApp {
     }
 }
 
+fn dir_entries<'a>(tree: &'a RepoTree, dir: &str) -> Vec<&'a gitpanel_core::RepoTreeEntry> {
+    let prefix = if dir.is_empty() {
+        String::new()
+    } else {
+        format!("{dir}/")
+    };
+    let mut entries: Vec<&gitpanel_core::RepoTreeEntry> = tree
+        .entries
+        .iter()
+        .filter(|entry| {
+            if dir.is_empty() {
+                !entry.path.contains('/')
+            } else {
+                entry
+                    .path
+                    .strip_prefix(&prefix)
+                    .is_some_and(|rest| !rest.is_empty() && !rest.contains('/'))
+            }
+        })
+        .collect();
+    entries.sort_by_key(|entry| (entry.kind != "dir", entry.name.to_ascii_lowercase()));
+    entries
+}
+
 fn action_status_badge(
     ui: &mut Ui,
     status: &str,
@@ -6219,5 +6725,49 @@ impl eframe::App for FatalApp {
                 ui.label(RichText::new(&self.message).monospace().size(12.0));
             });
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gitpanel_core::RepoTreeEntry;
+
+    fn entry(path: &str, kind: &str) -> RepoTreeEntry {
+        RepoTreeEntry {
+            path: path.to_owned(),
+            name: path.rsplit('/').next().unwrap_or(path).to_owned(),
+            kind: kind.to_owned(),
+            size: None,
+            sha: None,
+        }
+    }
+
+    #[test]
+    fn lists_only_the_current_folder_page() {
+        let tree = RepoTree {
+            entries: vec![
+                entry("src", "dir"),
+                entry("src/app.rs", "file"),
+                entry("src/lib.rs", "file"),
+                entry("README.md", "file"),
+            ],
+            truncated: false,
+        };
+        let root = dir_entries(&tree, "");
+        assert_eq!(
+            root.iter()
+                .map(|entry| entry.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["src", "README.md"]
+        );
+        let src = dir_entries(&tree, "src");
+        assert_eq!(
+            src.iter()
+                .map(|entry| entry.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["src/app.rs", "src/lib.rs"]
+        );
+        assert!(dir_entries(&tree, "missing").is_empty());
     }
 }

@@ -7,7 +7,7 @@ use chrono::{DateTime, Utc};
 use gitpanel_core::{
     Account, Branch, CommitData, CommitDiffResult, CompareResult, ContentEntry, ContentPayload,
     CreateRepoRequest, FilePatch, Issue, IssueComment, Label, PullRequest, RateLimit, Release,
-    ReleaseAsset, Repository, WorkflowJob, WorkflowRun, WorkflowStep,
+    ReleaseAsset, RepoTree, RepoTreeEntry, Repository, WorkflowJob, WorkflowRun, WorkflowStep,
 };
 use reqwest::header::{ACCEPT, HeaderMap};
 use reqwest::{Client, RequestBuilder, StatusCode, Url};
@@ -15,8 +15,9 @@ use serde_json::{Value, json};
 
 use crate::auth::Token;
 use crate::dto::{
-    BranchDto, CommentDto, CommitDetailDto, CompareDto, FileDto, IssueDto, PullRequestDto,
-    ReleaseDto, RepoDto, UserDto, WorkflowJobDto, WorkflowJobsDto, WorkflowRunDto, WorkflowRunsDto,
+    BranchDto, CommentDto, CommitDetailDto, CompareDto, FileDto, GitTreeDto, IssueDto,
+    PullRequestDto, ReleaseDto, RepoDto, UserDto, WorkflowJobDto, WorkflowJobsDto, WorkflowRunDto,
+    WorkflowRunsDto,
 };
 use crate::error::GithubError;
 
@@ -30,6 +31,17 @@ pub struct CommitPage {
     pub has_next: bool,
     pub end_cursor: Option<String>,
     pub rate_limit: Option<RateLimit>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct FileUpdate<'a> {
+    pub owner: &'a str,
+    pub repo: &'a str,
+    pub path: &'a str,
+    pub branch: &'a str,
+    pub content: &'a str,
+    pub message: &'a str,
+    pub sha: &'a str,
 }
 
 #[derive(Clone)]
@@ -335,6 +347,96 @@ impl GithubClient {
         let (_, _, body) = self.send(self.http.get(url)).await?;
         let value: Value = decode(&body, "repository contents")?;
         content_payload_from_value(&value, path)
+    }
+
+    pub async fn get_tree(
+        &self,
+        owner: &str,
+        repo: &str,
+        reference: &str,
+    ) -> Result<RepoTree, GithubError> {
+        let mut url = Url::parse(&format!("{}/repos/{owner}/{repo}/git/trees", self.api_base))
+            .map_err(|error| GithubError::Decode {
+                context: "tree URL".to_owned(),
+                details: error.to_string(),
+            })?;
+        {
+            let mut segments = url.path_segments_mut().map_err(|_| GithubError::Decode {
+                context: "tree URL".to_owned(),
+                details: "URL cannot be a base URL".to_owned(),
+            })?;
+            segments.push(reference);
+        }
+        url.query_pairs_mut().append_pair("recursive", "1");
+        let (_, _, body) = self.send(self.http.get(url)).await?;
+        let dto: GitTreeDto = decode(&body, "repository tree")?;
+        let entries = dto
+            .tree
+            .into_iter()
+            .filter_map(|item| {
+                let name = item
+                    .path
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(&item.path)
+                    .to_owned();
+                let kind = match item.kind.as_str() {
+                    "tree" => "dir",
+                    "blob" => "file",
+                    "commit" => "file",
+                    _ => return None,
+                };
+                Some(RepoTreeEntry {
+                    path: item.path,
+                    name,
+                    kind: kind.to_owned(),
+                    size: item.size,
+                    sha: item.sha,
+                })
+            })
+            .collect();
+        Ok(RepoTree {
+            entries,
+            truncated: dto.truncated,
+        })
+    }
+
+    pub async fn update_file(&self, update: FileUpdate<'_>) -> Result<CommitData, GithubError> {
+        let url = self.contents_url(update.owner, update.repo, update.path, "")?;
+        let body = json!({
+            "message": update.message,
+            "content": BASE64.encode(update.content.as_bytes()),
+            "branch": update.branch,
+            "sha": update.sha,
+        });
+        let (_, _, response) = self.send(self.http.put(url).json(&body)).await?;
+        let value: Value = decode(&response, "file update")?;
+        let commit = &value["commit"];
+        let commit_sha = commit["sha"].as_str().ok_or_else(|| GithubError::Decode {
+            context: "file update".to_owned(),
+            details: "missing commit sha".to_owned(),
+        })?;
+        let commit_message = commit["message"]
+            .as_str()
+            .unwrap_or(update.message)
+            .to_owned();
+        let author = &commit["author"];
+        let committed_at = author["date"]
+            .as_str()
+            .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+            .map(|value| value.with_timezone(&Utc))
+            .unwrap_or_else(Utc::now);
+        Ok(CommitData {
+            sha: commit_sha.to_owned(),
+            author_login: None,
+            author_name: author["name"].as_str().unwrap_or("GitHub").to_owned(),
+            author_email: author["email"].as_str().map(str::to_owned),
+            committed_at,
+            message: commit_message,
+            additions: 1,
+            deletions: 1,
+            is_merge: false,
+        })
     }
 
     pub async fn get_readme(
@@ -1042,7 +1144,7 @@ query($owner: String!, $name: String!, $branch: String!, $since: GitTimestamp!, 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wiremock::matchers::{method, path};
+    use wiremock::matchers::{body_json, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[tokio::test]
@@ -1243,6 +1345,77 @@ mod tests {
             .expect("file");
         assert_eq!(payload.content.as_deref(), Some("Hello"));
         assert!(!payload.binary);
+    }
+
+    #[tokio::test]
+    async fn reads_a_recursive_tree() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/MiguelSilvaPorto/gitpanel/git/trees/main"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "sha": "tree-sha",
+                "truncated": false,
+                "tree": [
+                    { "path": ".cargo", "mode": "040000", "type": "tree", "sha": "dir-sha" },
+                    { "path": ".cargo/config.toml", "mode": "100644", "type": "blob", "sha": "file-sha", "size": 63 },
+                    { "path": "vendor", "mode": "160000", "type": "commit", "sha": "submodule-sha" }
+                ]
+            })))
+            .mount(&server)
+            .await;
+        let client = GithubClient::with_base(Token::new("test"), server.uri()).expect("client");
+        let tree = client
+            .get_tree("MiguelSilvaPorto", "gitpanel", "main")
+            .await
+            .expect("tree");
+        assert!(!tree.truncated);
+        assert_eq!(tree.entries.len(), 3);
+        assert_eq!(tree.entries[0].kind, "dir");
+        assert_eq!(tree.entries[1].name, "config.toml");
+        assert_eq!(tree.entries[1].size, Some(63));
+        assert_eq!(tree.entries[2].kind, "file");
+    }
+
+    #[tokio::test]
+    async fn updates_a_file_with_a_sha() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/repos/MiguelSilvaPorto/gitpanel/contents/README.md"))
+            .and(body_json(serde_json::json!({
+                "message": "docs: update readme",
+                "content": "SGVsbG8=",
+                "branch": "main",
+                "sha": "file-sha"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "commit": {
+                    "sha": "commit-sha",
+                    "message": "docs: update readme",
+                    "author": {
+                        "name": "Miguel",
+                        "email": "m@example.com",
+                        "date": "2026-01-02T03:04:05Z"
+                    }
+                }
+            })))
+            .mount(&server)
+            .await;
+        let client = GithubClient::with_base(Token::new("test"), server.uri()).expect("client");
+        let commit = client
+            .update_file(FileUpdate {
+                owner: "MiguelSilvaPorto",
+                repo: "gitpanel",
+                path: "README.md",
+                branch: "main",
+                content: "Hello",
+                message: "docs: update readme",
+                sha: "file-sha",
+            })
+            .await
+            .expect("updated");
+        assert_eq!(commit.sha, "commit-sha");
+        assert_eq!(commit.message, "docs: update readme");
+        assert_eq!(commit.author_name, "Miguel");
     }
 
     #[tokio::test]

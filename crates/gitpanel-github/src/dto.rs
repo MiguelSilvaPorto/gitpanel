@@ -208,6 +208,23 @@ pub struct CommentDto {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct GitTreeDto {
+    #[serde(default)]
+    pub tree: Vec<GitTreeItemDto>,
+    #[serde(default)]
+    pub truncated: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct GitTreeItemDto {
+    pub path: String,
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub size: Option<u64>,
+    pub sha: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct WorkflowRunsDto {
     #[serde(default)]
     pub workflow_runs: Vec<WorkflowRunDto>,

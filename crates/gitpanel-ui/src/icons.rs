@@ -24,6 +24,7 @@ pub enum Icon {
     Local,
     Folder,
     File,
+    Pencil,
 }
 
 pub fn icon_button(ui: &mut Ui, icon: Icon, tooltip: &str) -> Response {
@@ -386,6 +387,25 @@ pub fn draw(ui: &Ui, icon: Icon, rect: Rect, color: Color32) {
                 [
                     Pos2::new(r.right() - 5.0, r.top() + 5.0),
                     Pos2::new(r.right(), r.top() + 5.0),
+                ],
+                stroke,
+            );
+        }
+        Icon::Pencil => {
+            painter.add(Shape::line(
+                vec![
+                    Pos2::new(r.left() + 2.0, r.bottom() - 2.0),
+                    Pos2::new(r.left() + 5.0, r.bottom() - 3.0),
+                    Pos2::new(r.right() - 2.0, r.top() + 3.0),
+                    Pos2::new(r.right() - 5.0, r.top() + 1.0),
+                    Pos2::new(r.left() + 2.0, r.bottom() - 2.0),
+                ],
+                stroke,
+            ));
+            painter.line_segment(
+                [
+                    Pos2::new(r.left() + 2.0, r.bottom() - 2.0),
+                    Pos2::new(r.left() + 1.0, r.bottom() - 1.0),
                 ],
                 stroke,
             );

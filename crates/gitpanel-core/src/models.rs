@@ -79,6 +79,21 @@ pub struct ContentEntry {
     pub download_url: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RepoTreeEntry {
+    pub path: String,
+    pub name: String,
+    pub kind: String,
+    pub size: Option<u64>,
+    pub sha: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RepoTree {
+    pub entries: Vec<RepoTreeEntry>,
+    pub truncated: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ContentPayload {
     pub path: String,
