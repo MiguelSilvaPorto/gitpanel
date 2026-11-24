@@ -346,6 +346,8 @@ define_keys! {
 
     SETTINGS_TITLE => "settings-title",
     SETTINGS_SUBTITLE => "settings-subtitle",
+    SETTINGS_TAB_CACHE => "settings-tab-cache",
+    SETTINGS_SAVE_HINT => "settings-save-hint",
     SETTINGS_ACCOUNT => "settings-account",
     SETTINGS_ACCOUNT_LOGIN => "settings-account-login",
     SETTINGS_ACCOUNT_NAME => "settings-account-name",

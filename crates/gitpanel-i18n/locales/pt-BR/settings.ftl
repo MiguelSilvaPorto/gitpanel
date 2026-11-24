@@ -1,5 +1,7 @@
 settings-title = Configurações
-settings-subtitle = Conta, sincronização e aparência.
+settings-subtitle = Organize conta, sincronização, aparência e armazenamento.
+settings-tab-cache = Cache
+settings-save-hint = As alterações são aplicadas ao salvar.
 settings-account = Conta
 settings-account-login = Login
 settings-account-name = Nome

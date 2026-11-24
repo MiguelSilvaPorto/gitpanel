@@ -14,7 +14,7 @@ use gitpanel_core::{
     IssueComment, Label, PullRequest, RateLimit, Release, RepoTree, Repository, ValidationError,
     WorkflowJob, WorkflowRun, validate_description, validate_repo_name,
 };
-use gitpanel_db::Db;
+use gitpanel_db::{CacheStats, Db};
 use gitpanel_diff::{Diff, Highlighter};
 use gitpanel_github::{FileUpdate, GithubClient, GithubError};
 use gitpanel_i18n::{Arg, LanguagePreference, Translator, keys};
@@ -165,6 +165,17 @@ impl SettingsForm {
             cache_max_file_kb: config.settings.cache.max_file_kb,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SettingsTab {
+    Account,
+    Sync,
+    Appearance,
+    Cache,
+    Paths,
+    GitHub,
+    About,
 }
 
 #[derive(Default)]
@@ -347,6 +358,8 @@ pub struct GitPanelApp {
     create_form: CreateForm,
     create_pending: Option<Receiver<Result<Repository, GithubError>>>,
     settings: SettingsForm,
+    settings_draft: SettingsForm,
+    settings_tab: SettingsTab,
     toasts: Vec<Toast>,
 }
 
@@ -374,6 +387,7 @@ impl GitPanelApp {
             Vec::new()
         });
         let settings = SettingsForm::from_config(&config);
+        let settings_draft = settings.clone();
         let mut app = Self {
             config,
             translator,
@@ -507,6 +521,8 @@ impl GitPanelApp {
             create_form: CreateForm::default(),
             create_pending: None,
             settings,
+            settings_draft,
+            settings_tab: SettingsTab::Account,
             toasts: Vec::new(),
         };
         app.initialize_auth();
@@ -514,6 +530,18 @@ impl GitPanelApp {
         if std::env::var("GITPANEL_OPEN_SETTINGS").is_ok() {
             app.screen = Screen::Settings;
             app.scroll_generation = app.scroll_generation.wrapping_add(1);
+        }
+        #[cfg(debug_assertions)]
+        if let Ok(tab) = std::env::var("GITPANEL_OPEN_SETTINGS_TAB") {
+            app.settings_tab = match tab.as_str() {
+                "sync" => SettingsTab::Sync,
+                "appearance" => SettingsTab::Appearance,
+                "cache" => SettingsTab::Cache,
+                "paths" => SettingsTab::Paths,
+                "github" => SettingsTab::GitHub,
+                "about" => SettingsTab::About,
+                _ => SettingsTab::Account,
+            };
         }
         #[cfg(debug_assertions)]
         if std::env::var("GITPANEL_OPEN_CREATE").is_ok() {
@@ -2585,6 +2613,7 @@ impl GitPanelApp {
             || self.config.settings.cache.keep_days != form.cache_keep_days
             || self.config.settings.cache.max_file_kb != form.cache_max_file_kb;
         self.settings = form.clone();
+        self.settings_draft = form.clone();
         self.config.settings.ui.theme = form.theme;
         self.config.settings.ui.language = form.language.clone();
         self.config.settings.sync.interval_minutes = form.interval_minutes;
@@ -2642,6 +2671,7 @@ impl GitPanelApp {
             ThemePreference::Dark
         };
         self.settings.theme = self.config.settings.ui.theme;
+        self.settings_draft.theme = self.config.settings.ui.theme;
         let _ = self.config.save();
         self.refresh_theme(ctx);
     }
@@ -5420,7 +5450,7 @@ impl GitPanelApp {
 
     fn screen_settings(&mut self, ui: &mut Ui) {
         let palette = self.theme.palette;
-        let mut form = self.settings.clone();
+        let mut form = self.settings_draft.clone();
         let mut save = false;
         let mut reload = false;
         let mut clear_cache = false;
@@ -5432,14 +5462,202 @@ impl GitPanelApp {
             &self.translator.text(keys::SETTINGS_SUBTITLE),
             palette,
         );
+
+        let mut requested_tab = None;
+        ui.horizontal_top(|ui| {
+            requested_tab = self.settings_nav(ui, palette);
+            ui.add_space(16.0);
+            ui.vertical(|ui| {
+                ui.set_min_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.label(
+                            RichText::new(self.settings_tab_title(self.settings_tab))
+                                .size(22.0)
+                                .strong()
+                                .color(palette.fg_default),
+                        );
+                        ui.label(
+                            RichText::new(self.translator.text(keys::SETTINGS_SAVE_HINT))
+                                .size(11.5)
+                                .color(palette.fg_subtle),
+                        );
+                    });
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui
+                            .add(primary_button(
+                                self.translator.text(keys::SETTINGS_SAVE),
+                                palette,
+                            ))
+                            .clicked()
+                        {
+                            save = true;
+                        }
+                    });
+                });
+                ui.add_space(12.0);
+                match self.settings_tab {
+                    SettingsTab::Account => {
+                        self.settings_account(ui, palette, &mut reload);
+                    }
+                    SettingsTab::Sync => {
+                        self.settings_sync(ui, palette, &mut form);
+                    }
+                    SettingsTab::Appearance => {
+                        self.settings_appearance(ui, palette, &mut form);
+                    }
+                    SettingsTab::Cache => {
+                        self.settings_cache(
+                            ui,
+                            palette,
+                            &mut form,
+                            cache_stats.as_ref(),
+                            &mut clear_cache,
+                            &mut vacuum,
+                        );
+                    }
+                    SettingsTab::Paths => {
+                        self.settings_paths(ui, palette);
+                    }
+                    SettingsTab::GitHub => {
+                        self.settings_github(ui, palette);
+                    }
+                    SettingsTab::About => {
+                        self.settings_about(ui, palette);
+                    }
+                }
+            });
+        });
+        if let Some(tab) = requested_tab {
+            self.settings_tab = tab;
+        }
+        self.settings_draft = form.clone();
+
+        if reload {
+            self.reload_auth_action();
+        }
+        if clear_cache {
+            match self.db.clear_cache() {
+                Ok(_) => self.toast(
+                    self.translator.text(keys::SETTINGS_CACHE_CLEARED),
+                    ToastKind::Success,
+                ),
+                Err(error) => self.toast(
+                    format!("{}: {error}", self.translator.text(keys::ERROR_DB)),
+                    ToastKind::Error,
+                ),
+            }
+        }
+        if vacuum {
+            match self.db.vacuum() {
+                Ok(()) => self.toast(
+                    self.translator.text(keys::SETTINGS_CACHE_VACUUMED),
+                    ToastKind::Success,
+                ),
+                Err(error) => self.toast(
+                    format!("{}: {error}", self.translator.text(keys::ERROR_DB)),
+                    ToastKind::Error,
+                ),
+            }
+        }
+        if save {
+            self.save_settings(form);
+        }
+    }
+
+    fn settings_nav(&self, ui: &mut Ui, palette: Palette) -> Option<SettingsTab> {
+        let labels = [
+            (
+                SettingsTab::Account,
+                self.translator.text(keys::SETTINGS_ACCOUNT),
+            ),
+            (SettingsTab::Sync, self.translator.text(keys::SETTINGS_SYNC)),
+            (
+                SettingsTab::Appearance,
+                self.translator.text(keys::SETTINGS_APPEARANCE),
+            ),
+            (
+                SettingsTab::Cache,
+                self.translator.text(keys::SETTINGS_TAB_CACHE),
+            ),
+            (
+                SettingsTab::Paths,
+                self.translator.text(keys::SETTINGS_PATHS),
+            ),
+            (
+                SettingsTab::GitHub,
+                self.translator.text(keys::SETTINGS_GITHUB),
+            ),
+            (
+                SettingsTab::About,
+                self.translator.text(keys::SETTINGS_ABOUT),
+            ),
+        ];
+        let mut selected = None;
+        Frame::NONE
+            .fill(palette.canvas_subtle)
+            .stroke(Stroke::new(1.0, palette.border_default))
+            .corner_radius(egui::CornerRadius::same(10))
+            .inner_margin(Margin::same(8))
+            .show(ui, |ui| {
+                ui.set_width(190.0);
+                ui.vertical(|ui| {
+                    for (tab, label) in labels {
+                        let is_selected = tab == self.settings_tab;
+                        let row_width = ui.available_width();
+                        let response = Frame::NONE
+                            .fill(if is_selected {
+                                palette.selection_bg
+                            } else {
+                                Color32::TRANSPARENT
+                            })
+                            .stroke(if is_selected {
+                                Stroke::new(1.0, palette.accent_emphasis)
+                            } else {
+                                Stroke::NONE
+                            })
+                            .corner_radius(egui::CornerRadius::same(6))
+                            .inner_margin(Margin::symmetric(10, 7))
+                            .show(ui, |ui| {
+                                ui.set_min_width((row_width - 20.0).max(80.0));
+                                ui.label(RichText::new(&label).size(12.5).strong().color(
+                                    if is_selected {
+                                        palette.fg_default
+                                    } else {
+                                        palette.fg_muted
+                                    },
+                                ));
+                            })
+                            .response
+                            .interact(egui::Sense::click());
+                        if response.hovered() {
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                        }
+                        if response.clicked() {
+                            selected = Some(tab);
+                        }
+                        ui.add_space(2.0);
+                    }
+                });
+            });
+        selected
+    }
+
+    fn settings_tab_title(&self, tab: SettingsTab) -> String {
+        match tab {
+            SettingsTab::Account => self.translator.text(keys::SETTINGS_ACCOUNT),
+            SettingsTab::Sync => self.translator.text(keys::SETTINGS_SYNC),
+            SettingsTab::Appearance => self.translator.text(keys::SETTINGS_APPEARANCE),
+            SettingsTab::Cache => self.translator.text(keys::SETTINGS_CACHE),
+            SettingsTab::Paths => self.translator.text(keys::SETTINGS_PATHS),
+            SettingsTab::GitHub => self.translator.text(keys::SETTINGS_GITHUB),
+            SettingsTab::About => self.translator.text(keys::SETTINGS_ABOUT),
+        }
+    }
+
+    fn settings_account(&self, ui: &mut Ui, palette: Palette, reload: &mut bool) {
         card(ui, palette, |ui| {
-            ui.label(
-                RichText::new(self.translator.text(keys::SETTINGS_ACCOUNT))
-                    .size(15.0)
-                    .strong()
-                    .color(palette.fg_default),
-            );
-            ui.add_space(4.0);
+            ui.set_min_width(ui.available_width());
             if let Some(account) = &self.account {
                 kv_row(
                     ui,
@@ -5479,22 +5697,18 @@ impl GitPanelApp {
                 ))
                 .clicked()
             {
-                reload = true;
+                *reload = true;
             }
             if let Some(error) = &self.auth_error {
                 ui.add_space(6.0);
                 error_banner(ui, &self.translator.text(keys::ERROR_AUTH), error, palette);
             }
         });
-        ui.add_space(12.0);
+    }
+
+    fn settings_sync(&self, ui: &mut Ui, palette: Palette, form: &mut SettingsForm) {
         card(ui, palette, |ui| {
-            ui.label(
-                RichText::new(self.translator.text(keys::SETTINGS_SYNC))
-                    .size(15.0)
-                    .strong()
-                    .color(palette.fg_default),
-            );
-            ui.add_space(4.0);
+            ui.set_min_width(ui.available_width());
             ui.horizontal(|ui| {
                 ui.label(
                     RichText::new(self.translator.text(keys::SETTINGS_SYNC_INTERVAL))
@@ -5508,6 +5722,7 @@ impl GitPanelApp {
                 self.translator.text(keys::SETTINGS_SYNC_INTERVAL_HINT),
                 palette,
             );
+            ui.add_space(6.0);
             ui.horizontal(|ui| {
                 ui.label(
                     RichText::new(self.translator.text(keys::SETTINGS_SYNC_BACKFILL))
@@ -5521,6 +5736,7 @@ impl GitPanelApp {
                 self.translator.text(keys::SETTINGS_SYNC_BACKFILL_HINT),
                 palette,
             );
+            ui.add_space(6.0);
             ui.add_enabled(
                 false,
                 egui::Checkbox::new(
@@ -5534,15 +5750,11 @@ impl GitPanelApp {
                 palette,
             );
         });
-        ui.add_space(12.0);
+    }
+
+    fn settings_appearance(&self, ui: &mut Ui, palette: Palette, form: &mut SettingsForm) {
         card(ui, palette, |ui| {
-            ui.label(
-                RichText::new(self.translator.text(keys::SETTINGS_APPEARANCE))
-                    .size(15.0)
-                    .strong()
-                    .color(palette.fg_default),
-            );
-            ui.add_space(4.0);
+            ui.set_min_width(ui.available_width());
             ui.label(
                 RichText::new(self.translator.text(keys::SETTINGS_THEME))
                     .size(12.0)
@@ -5565,6 +5777,7 @@ impl GitPanelApp {
                     self.translator.text(keys::SETTINGS_THEME_DARK),
                 );
             });
+            ui.add_space(6.0);
             ui.label(
                 RichText::new(self.translator.text(keys::SETTINGS_LANGUAGE))
                     .size(12.0)
@@ -5594,19 +5807,24 @@ impl GitPanelApp {
                     }
                 });
         });
-        ui.add_space(12.0);
+    }
+
+    fn settings_cache(
+        &self,
+        ui: &mut Ui,
+        palette: Palette,
+        form: &mut SettingsForm,
+        cache_stats: Option<&CacheStats>,
+        clear_cache: &mut bool,
+        vacuum: &mut bool,
+    ) {
         card(ui, palette, |ui| {
-            ui.label(
-                RichText::new(self.translator.text(keys::SETTINGS_CACHE))
-                    .size(15.0)
-                    .strong()
-                    .color(palette.fg_default),
-            );
-            ui.add_space(4.0);
+            ui.set_min_width(ui.available_width());
             ui.checkbox(
                 &mut form.cache_enabled,
                 self.translator.text(keys::SETTINGS_CACHE_ENABLED),
             );
+            ui.add_space(6.0);
             ui.horizontal(|ui| {
                 ui.label(
                     RichText::new(self.translator.text(keys::SETTINGS_CACHE_KEEP))
@@ -5625,6 +5843,7 @@ impl GitPanelApp {
             });
             muted(ui, self.translator.text(keys::SETTINGS_CACHE_HINT), palette);
             if let Some(stats) = cache_stats {
+                ui.add_space(6.0);
                 kv_row(
                     ui,
                     &self.translator.text(keys::SETTINGS_CACHE_DB_SIZE),
@@ -5641,6 +5860,7 @@ impl GitPanelApp {
                     palette,
                 );
             }
+            ui.add_space(6.0);
             ui.horizontal(|ui| {
                 if ui
                     .add(secondary_button(
@@ -5649,7 +5869,7 @@ impl GitPanelApp {
                     ))
                     .clicked()
                 {
-                    clear_cache = true;
+                    *clear_cache = true;
                 }
                 if ui
                     .add(secondary_button(
@@ -5658,19 +5878,15 @@ impl GitPanelApp {
                     ))
                     .clicked()
                 {
-                    vacuum = true;
+                    *vacuum = true;
                 }
             });
         });
-        ui.add_space(12.0);
+    }
+
+    fn settings_paths(&self, ui: &mut Ui, palette: Palette) {
         card(ui, palette, |ui| {
-            ui.label(
-                RichText::new(self.translator.text(keys::SETTINGS_PATHS))
-                    .size(15.0)
-                    .strong()
-                    .color(palette.fg_default),
-            );
-            ui.add_space(4.0);
+            ui.set_min_width(ui.available_width());
             kv_row(
                 ui,
                 &self.translator.text(keys::SETTINGS_DATA_DIR),
@@ -5690,15 +5906,11 @@ impl GitPanelApp {
                 palette,
             );
         });
-        ui.add_space(12.0);
+    }
+
+    fn settings_github(&self, ui: &mut Ui, palette: Palette) {
         card(ui, palette, |ui| {
-            ui.label(
-                RichText::new(self.translator.text(keys::SETTINGS_GITHUB))
-                    .size(15.0)
-                    .strong()
-                    .color(palette.fg_default),
-            );
-            ui.add_space(4.0);
+            ui.set_min_width(ui.available_width());
             kv_row(
                 ui,
                 &self.translator.text(keys::SETTINGS_GITHUB_HOST),
@@ -5732,14 +5944,11 @@ impl GitPanelApp {
                 );
             }
         });
-        ui.add_space(12.0);
+    }
+
+    fn settings_about(&self, ui: &mut Ui, palette: Palette) {
         card(ui, palette, |ui| {
-            ui.label(
-                RichText::new(self.translator.text(keys::SETTINGS_ABOUT))
-                    .size(15.0)
-                    .strong()
-                    .color(palette.fg_default),
-            );
+            ui.set_min_width(ui.available_width());
             kv_row(
                 ui,
                 &self.translator.text(keys::SETTINGS_VERSION),
@@ -5753,46 +5962,6 @@ impl GitPanelApp {
                 palette,
             );
         });
-        ui.add_space(16.0);
-        if ui
-            .add(primary_button(
-                self.translator.text(keys::SETTINGS_SAVE),
-                palette,
-            ))
-            .clicked()
-        {
-            save = true;
-        }
-        if reload {
-            self.reload_auth_action();
-        }
-        if clear_cache {
-            match self.db.clear_cache() {
-                Ok(_) => self.toast(
-                    self.translator.text(keys::SETTINGS_CACHE_CLEARED),
-                    ToastKind::Success,
-                ),
-                Err(error) => self.toast(
-                    format!("{}: {error}", self.translator.text(keys::ERROR_DB)),
-                    ToastKind::Error,
-                ),
-            }
-        }
-        if vacuum {
-            match self.db.vacuum() {
-                Ok(()) => self.toast(
-                    self.translator.text(keys::SETTINGS_CACHE_VACUUMED),
-                    ToastKind::Success,
-                ),
-                Err(error) => self.toast(
-                    format!("{}: {error}", self.translator.text(keys::ERROR_DB)),
-                    ToastKind::Error,
-                ),
-            }
-        }
-        if save {
-            self.save_settings(form);
-        }
     }
 
     fn create_modal(&mut self, ctx: &egui::Context) {
