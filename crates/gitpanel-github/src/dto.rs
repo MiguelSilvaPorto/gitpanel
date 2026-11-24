@@ -98,3 +98,36 @@ pub struct CommitDetailDto {
     #[serde(default)]
     pub files: Vec<FileDto>,
 }
+
+#[derive(Debug, Deserialize)]
+pub struct ReleaseDto {
+    pub id: i64,
+    pub tag_name: String,
+    pub name: Option<String>,
+    pub body: Option<String>,
+    #[serde(default)]
+    pub draft: bool,
+    #[serde(default)]
+    pub prerelease: bool,
+    pub created_at: DateTime<Utc>,
+    pub published_at: Option<DateTime<Utc>>,
+    pub html_url: String,
+    pub author: Option<ReleaseAuthorDto>,
+    #[serde(default)]
+    pub assets: Vec<ReleaseAssetDto>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ReleaseAuthorDto {
+    pub login: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ReleaseAssetDto {
+    pub name: String,
+    #[serde(default)]
+    pub size: u64,
+    #[serde(default)]
+    pub download_count: u64,
+    pub browser_download_url: String,
+}

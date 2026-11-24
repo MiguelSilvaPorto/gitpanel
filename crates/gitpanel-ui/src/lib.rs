@@ -4,15 +4,22 @@ pub mod charts;
 pub mod diff_view;
 pub mod format;
 pub mod icons;
+pub mod markdown;
+pub mod repo_grid;
 pub mod repo_table;
+pub mod source;
 pub mod theme;
 pub mod widgets;
 
 pub use charts::commit_chart;
 pub use diff_view::{DiffMode, DiffViewState, diff_view};
-pub use format::{compact_number, format_date, language_color, relative_time};
+pub use egui_commonmark::CommonMarkCache;
+pub use format::{compact_number, format_bytes, format_date, language_color, relative_time};
 pub use icons::{Icon, icon, icon_button};
+pub use markdown::markdown;
+pub use repo_grid::repo_grid;
 pub use repo_table::repo_table;
+pub use source::{DataSource, source_badge};
 pub use theme::{Palette, Theme, install_fonts, primary_button, secondary_button};
 pub use widgets::{
     badge, card, empty_state, error_banner, info_banner, kv_row, loading, muted, outline_badge,

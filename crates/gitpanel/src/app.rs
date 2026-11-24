@@ -9,8 +9,8 @@ use egui::{
 };
 use gitpanel_config::{Config, ThemePreference};
 use gitpanel_core::{
-    Account, Branch, Commit, CreateRepoRequest, FilePatch, RateLimit, Repository, ValidationError,
-    validate_description, validate_repo_name,
+    Account, Branch, Commit, CommitData, ContentPayload, CreateRepoRequest, FilePatch, RateLimit,
+    Release, Repository, ValidationError, validate_description, validate_repo_name,
 };
 use gitpanel_db::Db;
 use gitpanel_diff::{Diff, Highlighter};
@@ -19,10 +19,11 @@ use gitpanel_i18n::{Arg, LanguagePreference, Translator, keys};
 use gitpanel_metrics::{Granularity, aggregate_local, summary, top_contributors};
 use gitpanel_sync::{SyncEvent, SyncHandle};
 use gitpanel_ui::{
-    DiffViewState, Icon, Palette, Theme, badge, card, commit_chart, diff_view, empty_state,
-    error_banner, format_date, icon, icon_button, info_banner, install_fonts, kv_row, loading,
-    muted, outline_badge, page_header, panel_frame, primary_button, relative_time, repo_stats,
-    repo_table, search_input, secondary_button, stat_card, tabs,
+    CommonMarkCache, DataSource, DiffViewState, Icon, Palette, Theme, badge, card, commit_chart,
+    diff_view, empty_state, error_banner, format_bytes, format_date, icon, icon_button,
+    info_banner, install_fonts, kv_row, loading, markdown, muted, outline_badge, page_header,
+    panel_frame, primary_button, relative_time, repo_grid, repo_stats, repo_table, search_input,
+    secondary_button, source_badge, stat_card, tabs,
 };
 
 use crate::jobs::Jobs;
@@ -37,7 +38,10 @@ enum Screen {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RepoTab {
     Overview,
+    Code,
     Commits,
+    Branches,
+    Releases,
     Charts,
     Diff,
 }
@@ -46,17 +50,23 @@ impl RepoTab {
     fn index(self) -> usize {
         match self {
             Self::Overview => 0,
-            Self::Commits => 1,
-            Self::Charts => 2,
-            Self::Diff => 3,
+            Self::Code => 1,
+            Self::Commits => 2,
+            Self::Branches => 3,
+            Self::Releases => 4,
+            Self::Charts => 5,
+            Self::Diff => 6,
         }
     }
 
     fn from_index(index: usize) -> Self {
         match index {
-            1 => Self::Commits,
-            2 => Self::Charts,
-            3 => Self::Diff,
+            1 => Self::Code,
+            2 => Self::Commits,
+            3 => Self::Branches,
+            4 => Self::Releases,
+            5 => Self::Charts,
+            6 => Self::Diff,
             _ => Self::Overview,
         }
     }
@@ -67,6 +77,12 @@ enum RepoFilter {
     All,
     Own,
     Others,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RepoView {
+    Grid,
+    Table,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -175,6 +191,12 @@ struct DiffLoad {
     label: String,
 }
 
+struct BranchCommitsJob {
+    repo_id: i64,
+    branch: String,
+    commits: Vec<CommitData>,
+}
+
 pub struct GitPanelApp {
     config: Config,
     translator: Translator,
@@ -194,13 +216,47 @@ pub struct GitPanelApp {
     repo_tab: RepoTab,
     repo_search: String,
     repo_filter: RepoFilter,
+    repo_view: RepoView,
     commits: Vec<Commit>,
     commits_total: u32,
     commits_repo: Option<i64>,
+    commits_branch: String,
+    commits_source: DataSource,
+    commits_pending: Option<Receiver<Result<BranchCommitsJob, GithubError>>>,
+    commits_pending_repo: Option<i64>,
+    commits_pending_branch: Option<String>,
+    commits_error: Option<String>,
+    selected_branch: String,
     charts: ChartsState,
     branches: Vec<Branch>,
     branches_repo: Option<i64>,
     branches_pending: Option<Receiver<Result<Vec<Branch>, GithubError>>>,
+    branches_source: DataSource,
+    branches_error: Option<String>,
+    code_path: String,
+    contents: Option<ContentPayload>,
+    contents_repo: Option<i64>,
+    contents_branch: String,
+    contents_source: DataSource,
+    contents_pending: Option<Receiver<Result<ContentPayload, GithubError>>>,
+    contents_error: Option<String>,
+    readme: Option<ContentPayload>,
+    readme_repo: Option<i64>,
+    readme_branch: String,
+    readme_source: DataSource,
+    readme_pending: Option<Receiver<Result<Option<ContentPayload>, GithubError>>>,
+    readme_error: Option<String>,
+    code_file: Option<ContentPayload>,
+    code_file_path: Option<String>,
+    file_source: DataSource,
+    file_pending: Option<Receiver<Result<ContentPayload, GithubError>>>,
+    file_error: Option<String>,
+    releases: Vec<Release>,
+    releases_repo: Option<i64>,
+    releases_source: DataSource,
+    releases_pending: Option<Receiver<Result<Vec<Release>, GithubError>>>,
+    releases_error: Option<String>,
+    markdown_cache: CommonMarkCache,
     diff_source: DiffSource,
     diff_state: DiffViewState,
     diff: Option<Diff>,
@@ -259,13 +315,47 @@ impl GitPanelApp {
             repo_tab: RepoTab::Overview,
             repo_search: String::new(),
             repo_filter: RepoFilter::All,
+            repo_view: RepoView::Grid,
             commits: Vec::new(),
             commits_total: 0,
             commits_repo: None,
+            commits_branch: String::new(),
+            commits_source: DataSource::Remote,
+            commits_pending: None,
+            commits_pending_repo: None,
+            commits_pending_branch: None,
+            commits_error: None,
+            selected_branch: String::new(),
             charts: ChartsState::default(),
             branches: Vec::new(),
             branches_repo: None,
             branches_pending: None,
+            branches_source: DataSource::Remote,
+            branches_error: None,
+            code_path: String::new(),
+            contents: None,
+            contents_repo: None,
+            contents_branch: String::new(),
+            contents_source: DataSource::Remote,
+            contents_pending: None,
+            contents_error: None,
+            readme: None,
+            readme_repo: None,
+            readme_branch: String::new(),
+            readme_source: DataSource::Remote,
+            readme_pending: None,
+            readme_error: None,
+            code_file: None,
+            code_file_path: None,
+            file_source: DataSource::Remote,
+            file_pending: None,
+            file_error: None,
+            releases: Vec::new(),
+            releases_repo: None,
+            releases_source: DataSource::Remote,
+            releases_pending: None,
+            releases_error: None,
+            markdown_cache: CommonMarkCache::default(),
             diff_source: DiffSource::Commit,
             diff_state: DiffViewState::default(),
             diff: None,
@@ -303,6 +393,22 @@ impl GitPanelApp {
         {
             app.open_repository(repository.github_id);
             match std::env::var("GITPANEL_OPEN_TAB").as_deref() {
+                Ok("code") => {
+                    app.repo_tab = RepoTab::Code;
+                    app.ensure_code(&repository);
+                }
+                Ok("commits") => {
+                    app.repo_tab = RepoTab::Commits;
+                    app.ensure_commits(&repository);
+                }
+                Ok("branches") => {
+                    app.repo_tab = RepoTab::Branches;
+                    app.ensure_branches(&repository);
+                }
+                Ok("releases") => {
+                    app.repo_tab = RepoTab::Releases;
+                    app.load_releases(&repository, false);
+                }
                 Ok("charts") => {
                     app.repo_tab = RepoTab::Charts;
                     app.load_charts(repository.github_id);
@@ -310,11 +416,17 @@ impl GitPanelApp {
                 Ok("diff") => {
                     app.repo_tab = RepoTab::Diff;
                     app.ensure_branches(&repository);
+                    app.ensure_commits(&repository);
                     if std::env::var("GITPANEL_AUTO_DIFF").is_ok() {
                         app.start_diff();
                     }
                 }
                 _ => {}
+            }
+            #[cfg(debug_assertions)]
+            if let Ok(path) = std::env::var("GITPANEL_OPEN_PATH") {
+                let branch = app.selected_branch.clone();
+                app.load_file(&repository, &branch, &path, false);
             }
         }
         Ok(app)
@@ -426,18 +538,183 @@ impl GitPanelApp {
             match receiver.try_recv() {
                 Ok(Ok(branches)) => {
                     self.branches = branches;
-                    self.select_default_branches();
+                    self.branches_source = DataSource::Local;
+                    self.branches_error = None;
                     self.branches_pending = None;
+                    self.select_default_branches();
                 }
                 Ok(Err(error)) => {
-                    self.branches_repo = None;
-                    self.diff_error = Some(self.github_error_title(&error));
+                    self.branches_source = DataSource::Remote;
+                    self.branches_error = Some(self.github_error_title(&error));
                     self.branches_pending = None;
                 }
                 Err(TryRecvError::Empty) => self.branches_pending = Some(receiver),
                 Err(TryRecvError::Disconnected) => {
-                    self.branches_repo = None;
+                    self.branches_source = DataSource::Remote;
                     self.branches_pending = None;
+                }
+            }
+        }
+
+        if let Some(receiver) = self.releases_pending.take() {
+            match receiver.try_recv() {
+                Ok(Ok(releases)) => {
+                    if self.releases_repo.is_some()
+                        && let Ok(payload) = serde_json::to_string(&releases)
+                        && let Err(error) = self
+                            .db
+                            .put_release_cache(self.releases_repo.unwrap_or_default(), &payload)
+                    {
+                        tracing::warn!(%error, "could not cache releases");
+                    }
+                    self.releases = releases;
+                    self.releases_source = DataSource::Local;
+                    self.releases_error = None;
+                    self.releases_pending = None;
+                }
+                Ok(Err(error)) => {
+                    self.releases_source = DataSource::Remote;
+                    self.releases_error = Some(self.github_error_title(&error));
+                    self.releases_pending = None;
+                }
+                Err(TryRecvError::Empty) => self.releases_pending = Some(receiver),
+                Err(TryRecvError::Disconnected) => {
+                    self.releases_source = DataSource::Remote;
+                    self.releases_pending = None;
+                }
+            }
+        }
+
+        if let Some(receiver) = self.contents_pending.take() {
+            match receiver.try_recv() {
+                Ok(Ok(payload)) => {
+                    if let (Some(repo_id), branch, path) = (
+                        self.contents_repo,
+                        self.contents_branch.clone(),
+                        payload.path.clone(),
+                    ) && let Ok(serialized) = serde_json::to_string(&payload)
+                        && let Err(error) =
+                            self.db
+                                .put_content_cache(repo_id, &branch, &path, &serialized)
+                    {
+                        tracing::warn!(%error, "could not cache contents");
+                    }
+                    self.contents = Some(payload);
+                    self.contents_source = DataSource::Local;
+                    self.contents_error = None;
+                    self.contents_pending = None;
+                }
+                Ok(Err(error)) => {
+                    self.contents_source = DataSource::Remote;
+                    self.contents_error = Some(self.github_error_title(&error));
+                    self.contents_pending = None;
+                }
+                Err(TryRecvError::Empty) => self.contents_pending = Some(receiver),
+                Err(TryRecvError::Disconnected) => {
+                    self.contents_source = DataSource::Remote;
+                    self.contents_pending = None;
+                }
+            }
+        }
+
+        if let Some(receiver) = self.readme_pending.take() {
+            match receiver.try_recv() {
+                Ok(Ok(readme)) => {
+                    if let (Some(repo_id), Some(payload)) = (self.readme_repo, readme.as_ref())
+                        && let Ok(serialized) = serde_json::to_string(payload)
+                        && let Err(error) = self.db.put_content_cache(
+                            repo_id,
+                            &self.readme_branch,
+                            "__readme__",
+                            &serialized,
+                        )
+                    {
+                        tracing::warn!(%error, "could not cache readme");
+                    }
+                    self.readme = readme;
+                    self.readme_source = DataSource::Local;
+                    self.readme_error = None;
+                    self.readme_pending = None;
+                }
+                Ok(Err(error)) => {
+                    self.readme_source = DataSource::Remote;
+                    self.readme_error = Some(self.github_error_title(&error));
+                    self.readme_pending = None;
+                }
+                Err(TryRecvError::Empty) => self.readme_pending = Some(receiver),
+                Err(TryRecvError::Disconnected) => {
+                    self.readme_source = DataSource::Remote;
+                    self.readme_pending = None;
+                }
+            }
+        }
+
+        if let Some(receiver) = self.file_pending.take() {
+            match receiver.try_recv() {
+                Ok(Ok(payload)) => {
+                    if let (Some(repo_id), Some(path)) =
+                        (self.selected_repo_id, self.code_file_path.clone())
+                        && let Ok(serialized) = serde_json::to_string(&payload)
+                        && let Err(error) = self.db.put_content_cache(
+                            repo_id,
+                            &self.selected_branch,
+                            &path,
+                            &serialized,
+                        )
+                    {
+                        tracing::warn!(%error, "could not cache file");
+                    }
+                    self.code_file = Some(payload);
+                    self.file_source = DataSource::Local;
+                    self.file_error = None;
+                    self.file_pending = None;
+                }
+                Ok(Err(error)) => {
+                    self.file_source = DataSource::Remote;
+                    self.file_error = Some(self.github_error_title(&error));
+                    self.file_pending = None;
+                }
+                Err(TryRecvError::Empty) => self.file_pending = Some(receiver),
+                Err(TryRecvError::Disconnected) => {
+                    self.file_source = DataSource::Remote;
+                    self.file_pending = None;
+                }
+            }
+        }
+
+        if let Some(receiver) = self.commits_pending.take() {
+            match receiver.try_recv() {
+                Ok(Ok(job)) => {
+                    if let Err(error) =
+                        self.db
+                            .upsert_commits(job.repo_id, &job.branch, &job.commits)
+                    {
+                        self.commits_error =
+                            Some(format!("{}: {error}", self.translator.text(keys::ERROR_DB)));
+                    }
+                    if self.selected_repo_id == Some(job.repo_id)
+                        && self.selected_branch == job.branch
+                    {
+                        self.load_commits(job.repo_id, &job.branch);
+                        self.commits_source = DataSource::Local;
+                    }
+                    self.commits_pending = None;
+                    self.commits_pending_repo = None;
+                    self.commits_pending_branch = None;
+                }
+                Ok(Err(error)) => {
+                    self.commits_source = DataSource::Remote;
+                    self.commits_error = Some(self.github_error_title(&error));
+                    self.commits_pending = None;
+                    self.commits_pending_repo = None;
+                    self.commits_pending_branch = None;
+                }
+                Err(TryRecvError::Empty) => self.commits_pending = Some(receiver),
+                Err(TryRecvError::Disconnected) => {
+                    self.commits_source = DataSource::Remote;
+                    self.commits_pending = None;
+                    self.commits_pending_repo = None;
+                    self.commits_pending_branch = None;
                 }
             }
         }
@@ -590,7 +867,7 @@ impl GitPanelApp {
     fn reload_detail_data(&mut self) {
         if let Some(repo_id) = self.selected_repo_id {
             if self.commits_repo == Some(repo_id) {
-                self.load_commits(repo_id);
+                self.load_commits(repo_id, &self.commits_branch.clone());
             }
             if self.charts.repo_id == Some(repo_id) {
                 self.load_charts(repo_id);
@@ -598,12 +875,22 @@ impl GitPanelApp {
         }
     }
 
-    fn load_commits(&mut self, repo_id: i64) {
-        match self.db.list_commits(repo_id, 100, 0) {
+    fn load_commits(&mut self, repo_id: i64, branch: &str) {
+        match self.db.list_commits_for_branch(repo_id, branch, 100, 0) {
             Ok(commits) => {
                 self.commits = commits;
-                self.commits_total = self.db.count_commits(repo_id).unwrap_or(0);
+                self.commits_total = self
+                    .db
+                    .count_commits_for_branch(repo_id, branch)
+                    .unwrap_or(0);
                 self.commits_repo = Some(repo_id);
+                self.commits_branch = branch.to_owned();
+                self.commits_source = if self.commits.is_empty() {
+                    DataSource::Remote
+                } else {
+                    DataSource::Local
+                };
+                self.commits_error = None;
                 if self.selected_commit.is_none() {
                     self.selected_commit = self.commits.first().map(|commit| commit.sha.clone());
                 }
@@ -617,9 +904,12 @@ impl GitPanelApp {
         }
     }
 
-    fn load_more_commits(&mut self, repo_id: i64) {
+    fn load_more_commits(&mut self, repo_id: i64, branch: &str) {
         let offset = self.commits.len() as u32;
-        match self.db.list_commits(repo_id, 100, offset) {
+        match self
+            .db
+            .list_commits_for_branch(repo_id, branch, 100, offset)
+        {
             Ok(mut commits) => self.commits.append(&mut commits),
             Err(error) => {
                 self.toast(
@@ -631,7 +921,11 @@ impl GitPanelApp {
     }
 
     fn load_charts(&mut self, repo_id: i64) {
-        match self.db.list_all_commits(repo_id) {
+        let branch = self
+            .selected_repository()
+            .map(|repository| repository.default_branch.clone())
+            .unwrap_or_default();
+        match self.db.list_all_commits_for_branch(repo_id, &branch) {
             Ok(commits) => {
                 self.charts.commits = commits;
                 self.charts.repo_id = Some(repo_id);
@@ -651,6 +945,14 @@ impl GitPanelApp {
     }
 
     fn open_repository(&mut self, repo_id: i64) {
+        let Some(repository) = self
+            .repos
+            .iter()
+            .find(|repository| repository.github_id == repo_id)
+            .cloned()
+        else {
+            return;
+        };
         self.selected_repo_id = Some(repo_id);
         self.screen = Screen::Repository;
         self.scroll_generation = self.scroll_generation.wrapping_add(1);
@@ -659,10 +961,39 @@ impl GitPanelApp {
         self.commits.clear();
         self.commits_total = 0;
         self.commits_repo = None;
+        self.commits_branch.clear();
+        self.commits_source = DataSource::Remote;
+        self.commits_pending = None;
         self.charts = ChartsState::default();
+        self.selected_branch = repository.default_branch.clone();
         self.branches.clear();
         self.branches_repo = None;
         self.branches_pending = None;
+        self.branches_source = DataSource::Remote;
+        self.branches_error = None;
+        self.code_path.clear();
+        self.contents = None;
+        self.contents_repo = None;
+        self.contents_branch.clear();
+        self.contents_source = DataSource::Remote;
+        self.contents_pending = None;
+        self.contents_error = None;
+        self.readme = None;
+        self.readme_repo = None;
+        self.readme_branch.clear();
+        self.readme_source = DataSource::Remote;
+        self.readme_pending = None;
+        self.readme_error = None;
+        self.code_file = None;
+        self.code_file_path = None;
+        self.file_source = DataSource::Remote;
+        self.file_pending = None;
+        self.file_error = None;
+        self.releases.clear();
+        self.releases_repo = None;
+        self.releases_source = DataSource::Remote;
+        self.releases_pending = None;
+        self.releases_error = None;
         self.diff = None;
         self.diff_label.clear();
         self.diff_error = None;
@@ -671,7 +1002,17 @@ impl GitPanelApp {
         self.selected_commit = None;
         self.base_branch.clear();
         self.head_branch.clear();
-        self.load_commits(repo_id);
+        match self.db.list_branches(repo_id) {
+            Ok(branches) if !branches.is_empty() => {
+                self.branches = branches;
+                self.branches_repo = Some(repo_id);
+                self.branches_source = DataSource::Local;
+                self.select_default_branches();
+            }
+            Ok(_) => {}
+            Err(error) => tracing::warn!(%error, "could not load cached branches"),
+        }
+        self.load_commits(repo_id, &self.selected_branch.clone());
     }
 
     fn selected_repository(&self) -> Option<&Repository> {
@@ -755,13 +1096,31 @@ impl GitPanelApp {
     }
 
     fn ensure_branches(&mut self, repository: &Repository) {
-        if self.branches_repo == Some(repository.github_id) || self.branches_pending.is_some() {
+        if self.branches_repo == Some(repository.github_id) {
+            if !self.branches.is_empty() {
+                self.branches_source = DataSource::Local;
+            }
+            return;
+        }
+        if self.branches_pending.is_some() {
+            return;
+        }
+        if let Ok(branches) = self.db.list_branches(repository.github_id)
+            && !branches.is_empty()
+        {
+            self.branches = branches;
+            self.branches_repo = Some(repository.github_id);
+            self.branches_source = DataSource::Local;
+            self.branches_error = None;
+            self.select_default_branches();
             return;
         }
         let Some(client) = self.client.clone() else {
             return;
         };
         self.branches_repo = Some(repository.github_id);
+        self.branches_source = DataSource::Loading;
+        self.branches_error = None;
         let db = self.db.clone();
         let owner = repository.owner.clone();
         let name = repository.name.clone();
@@ -780,6 +1139,14 @@ impl GitPanelApp {
             return;
         };
         let default = repository.default_branch.clone();
+        if self.selected_branch.is_empty()
+            || !self
+                .branches
+                .iter()
+                .any(|branch| branch.name == self.selected_branch)
+        {
+            self.selected_branch = default.clone();
+        }
         if self.base_branch.is_empty()
             || !self
                 .branches
@@ -802,6 +1169,288 @@ impl GitPanelApp {
                 .map(|branch| branch.name.clone())
                 .unwrap_or(default);
         }
+    }
+
+    fn switch_branch(&mut self, repository: &Repository, branch: &str) {
+        if self.selected_branch == branch {
+            return;
+        }
+        self.selected_branch = branch.to_owned();
+        self.selected_commit = None;
+        self.commits.clear();
+        self.commits_repo = None;
+        self.commits_branch.clear();
+        self.commits_source = DataSource::Remote;
+        self.commits_error = None;
+        self.contents = None;
+        self.contents_repo = None;
+        self.contents_branch.clear();
+        self.contents_source = DataSource::Remote;
+        self.contents_error = None;
+        self.readme = None;
+        self.readme_repo = None;
+        self.readme_branch.clear();
+        self.readme_source = DataSource::Remote;
+        self.readme_error = None;
+        self.code_file = None;
+        self.code_file_path = None;
+        self.file_source = DataSource::Remote;
+        self.file_error = None;
+        self.code_path.clear();
+        self.load_commits(repository.github_id, branch);
+    }
+
+    fn ensure_commits(&mut self, repository: &Repository) {
+        let branch = if self.selected_branch.is_empty() {
+            repository.default_branch.clone()
+        } else {
+            self.selected_branch.clone()
+        };
+        if self.commits_repo == Some(repository.github_id)
+            && self.commits_branch == branch
+            && self.commits_source == DataSource::Local
+        {
+            return;
+        }
+        if self.commits_pending.is_some()
+            && self.commits_pending_repo == Some(repository.github_id)
+            && self.commits_pending_branch.as_deref() == Some(branch.as_str())
+        {
+            return;
+        }
+        if self.commits_error.is_some()
+            && self.commits_repo == Some(repository.github_id)
+            && self.commits_branch == branch
+        {
+            return;
+        }
+        match self
+            .db
+            .list_commits_for_branch(repository.github_id, &branch, 100, 0)
+        {
+            Ok(commits) if !commits.is_empty() => {
+                self.commits = commits;
+                self.commits_total = self
+                    .db
+                    .count_commits_for_branch(repository.github_id, &branch)
+                    .unwrap_or(0);
+                self.commits_repo = Some(repository.github_id);
+                self.commits_branch = branch;
+                self.commits_source = DataSource::Local;
+                self.commits_error = None;
+                if self.selected_commit.is_none() {
+                    self.selected_commit = self.commits.first().map(|commit| commit.sha.clone());
+                }
+                return;
+            }
+            Ok(_) => {}
+            Err(error) => tracing::warn!(%error, "could not load cached branch commits"),
+        }
+        let Some(client) = self.client.clone() else {
+            return;
+        };
+        self.commits_source = DataSource::Loading;
+        self.commits_pending_repo = Some(repository.github_id);
+        self.commits_pending_branch = Some(branch.clone());
+        let owner = repository.owner.clone();
+        let name = repository.name.clone();
+        let repo_id = repository.github_id;
+        self.commits_pending = Some(self.jobs.spawn(async move {
+            let since = DateTime::<Utc>::from_timestamp(0, 0).unwrap_or_else(Utc::now);
+            let mut cursor = None;
+            let mut commits = Vec::new();
+            for _ in 0..5 {
+                let page = client
+                    .fetch_commits_page(&owner, &name, &branch, since, cursor.as_deref())
+                    .await?;
+                commits.extend(page.commits);
+                if !page.has_next {
+                    break;
+                }
+                cursor = page.end_cursor;
+                if cursor.is_none() {
+                    break;
+                }
+            }
+            Ok(BranchCommitsJob {
+                repo_id,
+                branch,
+                commits,
+            })
+        }));
+    }
+
+    fn ensure_code(&mut self, repository: &Repository) {
+        self.ensure_branches(repository);
+        let branch = if self.selected_branch.is_empty() {
+            repository.default_branch.clone()
+        } else {
+            self.selected_branch.clone()
+        };
+        if (self.contents_repo != Some(repository.github_id)
+            || self.contents_branch != branch
+            || self.contents.is_none())
+            && self.contents_pending.is_none()
+        {
+            self.load_contents(repository, &branch, &self.code_path.clone(), false);
+        }
+        if (self.readme_repo != Some(repository.github_id) || self.readme_branch != branch)
+            && self.readme_pending.is_none()
+        {
+            self.load_readme(repository, &branch, false);
+        }
+    }
+
+    fn load_contents(&mut self, repository: &Repository, branch: &str, path: &str, refresh: bool) {
+        if self.contents_pending.is_some() {
+            return;
+        }
+        if !refresh
+            && self.contents_error.is_some()
+            && self.contents_repo == Some(repository.github_id)
+            && self.contents_branch == branch
+            && self.code_path == path
+        {
+            return;
+        }
+        self.code_path = path.to_owned();
+        self.code_file = None;
+        self.code_file_path = None;
+        self.file_source = DataSource::Remote;
+        self.file_error = None;
+        if !refresh
+            && let Some(payload) = self
+                .db
+                .get_content_cache(repository.github_id, branch, path)
+                .ok()
+                .flatten()
+                .and_then(|value| serde_json::from_str::<ContentPayload>(&value).ok())
+        {
+            self.contents = Some(payload);
+            self.contents_repo = Some(repository.github_id);
+            self.contents_branch = branch.to_owned();
+            self.contents_source = DataSource::Local;
+            self.contents_error = None;
+            return;
+        }
+        let Some(client) = self.client.clone() else {
+            return;
+        };
+        self.contents_repo = Some(repository.github_id);
+        self.contents_branch = branch.to_owned();
+        self.contents_source = DataSource::Loading;
+        self.contents_error = None;
+        let owner = repository.owner.clone();
+        let name = repository.name.clone();
+        let path = path.to_owned();
+        let branch = branch.to_owned();
+        self.contents_pending = Some(
+            self.jobs
+                .spawn(async move { client.get_contents(&owner, &name, &path, &branch).await }),
+        );
+    }
+
+    fn load_readme(&mut self, repository: &Repository, branch: &str, refresh: bool) {
+        if self.readme_pending.is_some() {
+            return;
+        }
+        if !refresh
+            && let Some(cached) = self
+                .db
+                .get_content_cache(repository.github_id, branch, "__readme__")
+                .ok()
+                .flatten()
+        {
+            self.readme = serde_json::from_str::<ContentPayload>(&cached).ok();
+            self.readme_repo = Some(repository.github_id);
+            self.readme_branch = branch.to_owned();
+            self.readme_source = DataSource::Local;
+            self.readme_error = None;
+            return;
+        }
+        let Some(client) = self.client.clone() else {
+            return;
+        };
+        self.readme_repo = Some(repository.github_id);
+        self.readme_branch = branch.to_owned();
+        self.readme_source = DataSource::Loading;
+        self.readme_error = None;
+        let owner = repository.owner.clone();
+        let name = repository.name.clone();
+        let branch = branch.to_owned();
+        self.readme_pending = Some(
+            self.jobs
+                .spawn(async move { client.get_readme(&owner, &name, &branch).await }),
+        );
+    }
+
+    fn load_file(&mut self, repository: &Repository, branch: &str, path: &str, refresh: bool) {
+        if self.file_pending.is_some() {
+            return;
+        }
+        self.code_file_path = Some(path.to_owned());
+        self.code_file = None;
+        if !refresh
+            && let Some(payload) = self
+                .db
+                .get_content_cache(repository.github_id, branch, path)
+                .ok()
+                .flatten()
+                .and_then(|value| serde_json::from_str::<ContentPayload>(&value).ok())
+        {
+            self.code_file = Some(payload);
+            self.file_source = DataSource::Local;
+            self.file_error = None;
+            return;
+        }
+        let Some(client) = self.client.clone() else {
+            return;
+        };
+        self.file_source = DataSource::Loading;
+        self.file_error = None;
+        let owner = repository.owner.clone();
+        let name = repository.name.clone();
+        let path = path.to_owned();
+        let branch = branch.to_owned();
+        self.file_pending = Some(
+            self.jobs
+                .spawn(async move { client.get_contents(&owner, &name, &path, &branch).await }),
+        );
+    }
+
+    fn load_releases(&mut self, repository: &Repository, refresh: bool) {
+        if self.releases_pending.is_some() {
+            return;
+        }
+        if !refresh && self.releases_repo == Some(repository.github_id) {
+            return;
+        }
+        if !refresh
+            && let Some(cached) = self
+                .db
+                .get_release_cache(repository.github_id)
+                .ok()
+                .flatten()
+            && let Ok(releases) = serde_json::from_str::<Vec<Release>>(&cached)
+        {
+            self.releases = releases;
+            self.releases_repo = Some(repository.github_id);
+            self.releases_source = DataSource::Local;
+            self.releases_error = None;
+            return;
+        }
+        let Some(client) = self.client.clone() else {
+            return;
+        };
+        self.releases_repo = Some(repository.github_id);
+        self.releases_source = DataSource::Loading;
+        self.releases_error = None;
+        let owner = repository.owner.clone();
+        let name = repository.name.clone();
+        self.releases_pending = Some(
+            self.jobs
+                .spawn(async move { client.list_releases(&owner, &name).await }),
+        );
     }
 
     fn start_diff(&mut self) {
@@ -1102,6 +1751,7 @@ impl GitPanelApp {
             });
         });
         ui.add_space(14.0);
+        let mut repo_view = self.repo_view;
         ui.horizontal(|ui| {
             search_input(
                 ui,
@@ -1134,8 +1784,19 @@ impl GitPanelApp {
                     .size(12.0)
                     .color(palette.fg_muted),
                 );
+                ui.selectable_value(
+                    &mut repo_view,
+                    RepoView::Table,
+                    self.translator.text(keys::REPOS_VIEW_TABLE),
+                );
+                ui.selectable_value(
+                    &mut repo_view,
+                    RepoView::Grid,
+                    self.translator.text(keys::REPOS_VIEW_GRID),
+                );
             });
         });
+        self.repo_view = repo_view;
         ui.add_space(10.0);
 
         if self.auth_error.is_some() {
@@ -1186,15 +1847,28 @@ impl GitPanelApp {
                 palette,
                 Some(Icon::Repo),
             );
-        } else if let Some(repo_id) = repo_table(
-            ui,
-            &filtered,
-            &self.translator,
-            palette,
-            self.selected_repo_id,
-            self.sync_state.current_repo_id,
-        ) {
-            self.open_repository(repo_id);
+        } else {
+            let clicked = match self.repo_view {
+                RepoView::Grid => repo_grid(
+                    ui,
+                    &filtered,
+                    &self.translator,
+                    palette,
+                    self.selected_repo_id,
+                    self.sync_state.current_repo_id,
+                ),
+                RepoView::Table => repo_table(
+                    ui,
+                    &filtered,
+                    &self.translator,
+                    palette,
+                    self.selected_repo_id,
+                    self.sync_state.current_repo_id,
+                ),
+            };
+            if let Some(repo_id) = clicked {
+                self.open_repository(repo_id);
+            }
         }
 
         if create {
@@ -1300,7 +1974,10 @@ impl GitPanelApp {
 
         let tab_labels = [
             self.translator.text(keys::TAB_OVERVIEW),
+            self.translator.text(keys::TAB_CODE),
             self.translator.text(keys::TAB_COMMITS),
+            self.translator.text(keys::TAB_BRANCHES),
+            self.translator.text(keys::TAB_RELEASES),
             self.translator.text(keys::TAB_CHARTS),
             self.translator.text(keys::TAB_DIFF),
         ];
@@ -1310,11 +1987,10 @@ impl GitPanelApp {
             let tab = RepoTab::from_index(selected);
             self.repo_tab = tab;
             match tab {
-                RepoTab::Commits => {
-                    if self.commits_repo != Some(repository.github_id) {
-                        self.load_commits(repository.github_id);
-                    }
-                }
+                RepoTab::Code => self.ensure_code(&repository),
+                RepoTab::Commits => self.ensure_commits(&repository),
+                RepoTab::Branches => self.ensure_branches(&repository),
+                RepoTab::Releases => self.load_releases(&repository, false),
                 RepoTab::Charts => {
                     if self.charts.repo_id != Some(repository.github_id) {
                         self.load_charts(repository.github_id);
@@ -1322,6 +1998,7 @@ impl GitPanelApp {
                 }
                 RepoTab::Diff => {
                     self.ensure_branches(&repository);
+                    self.ensure_commits(&repository);
                     if self.selected_commit.is_none() {
                         self.selected_commit =
                             self.commits.first().map(|commit| commit.sha.clone());
@@ -1333,7 +2010,10 @@ impl GitPanelApp {
 
         match self.repo_tab {
             RepoTab::Overview => self.overview_panel(ui, &repository),
+            RepoTab::Code => self.code_panel(ui, &repository),
             RepoTab::Commits => self.commits_panel(ui, &repository),
+            RepoTab::Branches => self.branches_panel(ui, &repository),
+            RepoTab::Releases => self.releases_panel(ui, &repository),
             RepoTab::Charts => self.charts_panel(ui, &repository),
             RepoTab::Diff => self.diff_panel(ui, &repository),
         }
@@ -1347,6 +2027,631 @@ impl GitPanelApp {
         }
         if sync_repo {
             self.sync_repository(repository.github_id);
+        }
+    }
+
+    fn branch_combo(&mut self, ui: &mut Ui, repository: &Repository) -> bool {
+        let previous = self.selected_branch.clone();
+        if self.selected_branch.is_empty() {
+            self.selected_branch = repository.default_branch.clone();
+        }
+        let branch_names: Vec<String> = self
+            .branches
+            .iter()
+            .map(|branch| branch.name.clone())
+            .collect();
+        let default_branch = repository.default_branch.clone();
+        egui::ComboBox::from_id_salt(("repo-branch", repository.github_id))
+            .selected_text(self.selected_branch.clone())
+            .width(220.0)
+            .show_ui(ui, |ui| {
+                if branch_names.is_empty() {
+                    ui.selectable_value(
+                        &mut self.selected_branch,
+                        default_branch.clone(),
+                        &default_branch,
+                    );
+                } else {
+                    for branch in &branch_names {
+                        ui.selectable_value(&mut self.selected_branch, branch.clone(), branch);
+                    }
+                }
+            });
+        if self.selected_branch != previous {
+            self.switch_branch(repository, &self.selected_branch.clone());
+            true
+        } else {
+            false
+        }
+    }
+
+    fn code_panel(&mut self, ui: &mut Ui, repository: &Repository) {
+        let palette = self.theme.palette;
+        self.ensure_code(repository);
+        let mut refresh = false;
+        let mut branch_changed = false;
+        ui.horizontal_wrapped(|ui| {
+            ui.label(
+                RichText::new(self.translator.text(keys::COMMON_BRANCH))
+                    .size(12.0)
+                    .color(palette.fg_muted),
+            );
+            branch_changed = self.branch_combo(ui, repository);
+            source_badge(ui, self.contents_source, &self.translator, palette);
+            if ui
+                .add(secondary_button(
+                    self.translator.text(keys::CODE_REFRESH),
+                    palette,
+                ))
+                .clicked()
+            {
+                refresh = true;
+            }
+        });
+        if branch_changed {
+            self.ensure_code(repository);
+        }
+        if let Some(error) = &self.branches_error {
+            error_banner(ui, &self.translator.text(keys::ERROR_SYNC), error, palette);
+        }
+        if refresh {
+            self.load_contents(
+                repository,
+                &self.selected_branch.clone(),
+                &self.code_path.clone(),
+                true,
+            );
+            self.load_readme(repository, &self.selected_branch.clone(), true);
+        }
+
+        let mut navigate = None;
+        if !self.code_path.is_empty() {
+            ui.horizontal_wrapped(|ui| {
+                if ui
+                    .add(
+                        egui::Button::new(
+                            RichText::new(self.translator.text(keys::CODE_ROOT))
+                                .size(12.0)
+                                .color(palette.accent_fg),
+                        )
+                        .frame(false),
+                    )
+                    .clicked()
+                {
+                    navigate = Some(String::new());
+                }
+                let parts: Vec<String> = self
+                    .code_path
+                    .split('/')
+                    .filter(|part| !part.is_empty())
+                    .map(str::to_owned)
+                    .collect();
+                let mut accumulated = String::new();
+                for part in parts {
+                    if !accumulated.is_empty() {
+                        ui.label(RichText::new("/").color(palette.fg_subtle));
+                    }
+                    accumulated.push_str(&part);
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                RichText::new(&part).size(12.0).color(palette.accent_fg),
+                            )
+                            .frame(false),
+                        )
+                        .clicked()
+                    {
+                        navigate = Some(accumulated.clone());
+                    }
+                    accumulated.push('/');
+                }
+            });
+            ui.add_space(4.0);
+        }
+
+        let mut open_file = None;
+        if self.contents_pending.is_some() {
+            loading(ui, &self.translator.text(keys::CODE_LOADING), palette);
+        } else if let Some(error) = &self.contents_error {
+            error_banner(
+                ui,
+                &self.translator.text(keys::ERROR_GENERIC),
+                error,
+                palette,
+            );
+        } else if let Some(payload) = &self.contents {
+            if payload.is_dir() {
+                let mut entries = payload.entries.clone();
+                entries.sort_by_key(|entry| (entry.kind != "dir", entry.name.to_ascii_lowercase()));
+                if entries.is_empty() {
+                    muted(ui, self.translator.text(keys::CODE_EMPTY), palette);
+                } else {
+                    ScrollArea::vertical()
+                        .id_salt((
+                            "code-directory",
+                            repository.github_id,
+                            self.code_path.clone(),
+                        ))
+                        .max_height(280.0)
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            let repo_id = repository.github_id;
+                            let branch = self.selected_branch.clone();
+                            for entry in entries {
+                                let cached = self
+                                    .db
+                                    .get_content_cache(repo_id, &branch, &entry.path)
+                                    .ok()
+                                    .flatten()
+                                    .is_some();
+                                ui.horizontal(|ui| {
+                                    icon(
+                                        ui,
+                                        if entry.kind == "dir" {
+                                            Icon::Folder
+                                        } else {
+                                            Icon::File
+                                        },
+                                        15.0,
+                                        palette.fg_muted,
+                                    );
+                                    let response = ui.add(
+                                        egui::Button::new(
+                                            RichText::new(&entry.name).size(12.0).color(
+                                                if entry.kind == "dir" {
+                                                    palette.accent_fg
+                                                } else {
+                                                    palette.fg_default
+                                                },
+                                            ),
+                                        )
+                                        .frame(false),
+                                    );
+                                    if response.clicked() {
+                                        if entry.kind == "dir" {
+                                            navigate = Some(entry.path.clone());
+                                        } else {
+                                            open_file = Some(entry.path.clone());
+                                        }
+                                    }
+                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                        if let Some(url) = &entry.html_url
+                                            && ui
+                                                .add(
+                                                    egui::Button::new(
+                                                        RichText::new("↗")
+                                                            .size(11.0)
+                                                            .color(palette.fg_subtle),
+                                                    )
+                                                    .frame(false),
+                                                )
+                                                .clicked()
+                                        {
+                                            ui.ctx().open_url(egui::OpenUrl::new_tab(url.clone()));
+                                        }
+                                        icon(
+                                            ui,
+                                            if cached { Icon::Local } else { Icon::Cloud },
+                                            11.0,
+                                            if cached {
+                                                palette.success_fg
+                                            } else {
+                                                palette.fg_subtle
+                                            },
+                                        );
+                                        if entry.kind != "dir"
+                                            && let Some(size) = entry.size
+                                        {
+                                            ui.label(
+                                                RichText::new(format_bytes(size))
+                                                    .size(10.5)
+                                                    .color(palette.fg_subtle),
+                                            );
+                                        }
+                                    });
+                                });
+                                ui.separator();
+                            }
+                        });
+                }
+            } else if let Some(content) = &payload.content {
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(content)
+                            .monospace()
+                            .size(11.5)
+                            .color(palette.fg_default),
+                    )
+                    .wrap_mode(egui::TextWrapMode::Extend),
+                );
+            }
+        }
+
+        if let Some(path) = open_file {
+            self.load_file(repository, &self.selected_branch.clone(), &path, false);
+        }
+        if let Some(path) = navigate {
+            self.load_contents(repository, &self.selected_branch.clone(), &path, false);
+        }
+
+        self.code_file_view(ui, repository);
+
+        if self.code_path.is_empty()
+            && let Some(readme) = self.readme.clone()
+        {
+            ui.add_space(12.0);
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(self.translator.text(keys::CODE_README))
+                        .size(14.0)
+                        .strong()
+                        .color(palette.fg_default),
+                );
+                source_badge(ui, self.readme_source, &self.translator, palette);
+            });
+            ui.add_space(4.0);
+            if let Some(content) = &readme.content {
+                markdown(ui, &mut self.markdown_cache, content);
+            } else if readme.binary {
+                info_banner(ui, &self.translator.text(keys::CODE_BINARY), palette);
+            } else if readme.truncated {
+                info_banner(ui, &self.translator.text(keys::CODE_TOO_LARGE), palette);
+            }
+        }
+    }
+
+    fn code_file_view(&mut self, ui: &mut Ui, repository: &Repository) {
+        let Some(path) = self.code_file_path.clone() else {
+            return;
+        };
+        let palette = self.theme.palette;
+        ui.add_space(10.0);
+        ui.separator();
+        ui.horizontal_wrapped(|ui| {
+            icon(ui, Icon::File, 15.0, palette.fg_muted);
+            ui.label(
+                RichText::new(&path)
+                    .monospace()
+                    .size(12.0)
+                    .strong()
+                    .color(palette.fg_default),
+            );
+            source_badge(ui, self.file_source, &self.translator, palette);
+            if let Some(file) = &self.code_file
+                && let Some(url) = &file.html_url
+                && ui
+                    .add(
+                        egui::Button::new(
+                            RichText::new(self.translator.text(keys::COMMON_OPEN_GITHUB))
+                                .size(11.0)
+                                .color(palette.accent_fg),
+                        )
+                        .frame(false),
+                    )
+                    .clicked()
+            {
+                ui.ctx().open_url(egui::OpenUrl::new_tab(url.clone()));
+            }
+        });
+        if self.file_pending.is_some() {
+            loading(ui, &self.translator.text(keys::CODE_FILE_LOADING), palette);
+            return;
+        }
+        if let Some(error) = &self.file_error {
+            error_banner(
+                ui,
+                &self.translator.text(keys::ERROR_GENERIC),
+                error,
+                palette,
+            );
+            return;
+        }
+        let Some(file) = &self.code_file else {
+            return;
+        };
+        if file.binary {
+            info_banner(ui, &self.translator.text(keys::CODE_BINARY), palette);
+            return;
+        }
+        if file.truncated {
+            info_banner(ui, &self.translator.text(keys::CODE_TOO_LARGE), palette);
+            return;
+        }
+        if let Some(content) = &file.content {
+            let content = if content.chars().count() > 50_000 {
+                content.chars().take(50_000).collect::<String>()
+            } else {
+                content.clone()
+            };
+            ScrollArea::both()
+                .id_salt(("code-file", repository.github_id, path))
+                .max_height(340.0)
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(content)
+                                .monospace()
+                                .size(11.0)
+                                .color(palette.fg_default),
+                        )
+                        .wrap_mode(egui::TextWrapMode::Extend),
+                    );
+                });
+        } else {
+            muted(ui, self.translator.text(keys::CODE_EMPTY), palette);
+        }
+    }
+
+    fn branches_panel(&mut self, ui: &mut Ui, repository: &Repository) {
+        let palette = self.theme.palette;
+        self.ensure_branches(repository);
+        let mut refresh = false;
+        ui.horizontal_wrapped(|ui| {
+            ui.label(
+                RichText::new(self.translator.text(keys::BRANCHES_TITLE))
+                    .size(15.0)
+                    .strong()
+                    .color(palette.fg_default),
+            );
+            source_badge(ui, self.branches_source, &self.translator, palette);
+            if ui
+                .add(secondary_button(
+                    self.translator.text(keys::BRANCHES_REFRESH),
+                    palette,
+                ))
+                .clicked()
+            {
+                refresh = true;
+            }
+        });
+        if refresh {
+            self.branches_repo = None;
+            self.branches_pending = None;
+            self.branches.clear();
+            self.branches_source = DataSource::Remote;
+            self.ensure_branches(repository);
+        }
+        if let Some(error) = &self.branches_error {
+            error_banner(
+                ui,
+                &self.translator.text(keys::ERROR_GENERIC),
+                error,
+                palette,
+            );
+        }
+        if self.branches_pending.is_some() {
+            loading(ui, &self.translator.text(keys::CODE_LOADING), palette);
+            return;
+        }
+        if self.branches.is_empty() {
+            empty_state(
+                ui,
+                &self.translator.text(keys::BRANCHES_EMPTY),
+                "",
+                palette,
+                Some(Icon::Branch),
+            );
+            return;
+        }
+        let branches = self.branches.clone();
+        let mut open_branch = None;
+        for branch in branches {
+            let is_default = branch.name == repository.default_branch;
+            let is_selected = branch.name == self.selected_branch;
+            Frame::NONE
+                .fill(if is_selected {
+                    palette.selection_bg
+                } else {
+                    palette.canvas_default
+                })
+                .inner_margin(Margin::symmetric(8, 6))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        icon(ui, Icon::Branch, 15.0, palette.fg_muted);
+                        if ui
+                            .selectable_label(
+                                is_selected,
+                                RichText::new(&branch.name)
+                                    .size(12.5)
+                                    .strong()
+                                    .color(palette.fg_default),
+                            )
+                            .clicked()
+                        {
+                            open_branch = Some(branch.name.clone());
+                        }
+                        if is_default {
+                            badge(
+                                ui,
+                                self.translator.text(keys::BRANCHES_DEFAULT),
+                                palette.canvas_inset,
+                                palette.fg_muted,
+                            );
+                        }
+                        if branch.protected {
+                            badge(
+                                ui,
+                                self.translator.text(keys::BRANCHES_PROTECTED),
+                                palette.diff_add_bg,
+                                palette.success_fg,
+                            );
+                        }
+                        ui.label(
+                            RichText::new(&branch.sha)
+                                .monospace()
+                                .size(10.5)
+                                .color(palette.fg_subtle),
+                        );
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if ui
+                                .add(
+                                    egui::Button::new(
+                                        RichText::new(
+                                            self.translator.text(keys::BRANCHES_VIEW_CODE),
+                                        )
+                                        .size(11.0)
+                                        .color(palette.accent_fg),
+                                    )
+                                    .frame(false),
+                                )
+                                .clicked()
+                            {
+                                open_branch = Some(branch.name.clone());
+                            }
+                        });
+                    });
+                });
+            ui.separator();
+        }
+        if let Some(branch) = open_branch {
+            self.switch_branch(repository, &branch);
+            self.repo_tab = RepoTab::Code;
+            self.ensure_code(repository);
+        }
+    }
+
+    fn releases_panel(&mut self, ui: &mut Ui, repository: &Repository) {
+        let palette = self.theme.palette;
+        self.load_releases(repository, false);
+        let mut refresh = false;
+        ui.horizontal_wrapped(|ui| {
+            ui.label(
+                RichText::new(self.translator.text(keys::RELEASES_TITLE))
+                    .size(15.0)
+                    .strong()
+                    .color(palette.fg_default),
+            );
+            source_badge(ui, self.releases_source, &self.translator, palette);
+            if ui
+                .add(secondary_button(
+                    self.translator.text(keys::RELEASES_REFRESH),
+                    palette,
+                ))
+                .clicked()
+            {
+                refresh = true;
+            }
+        });
+        if refresh {
+            self.load_releases(repository, true);
+        }
+        if let Some(error) = &self.releases_error {
+            error_banner(
+                ui,
+                &self.translator.text(keys::ERROR_GENERIC),
+                error,
+                palette,
+            );
+        }
+        if self.releases_pending.is_some() {
+            loading(ui, &self.translator.text(keys::CODE_LOADING), palette);
+            return;
+        }
+        if self.releases.is_empty() {
+            empty_state(
+                ui,
+                &self.translator.text(keys::RELEASES_EMPTY),
+                "",
+                palette,
+                Some(Icon::Repo),
+            );
+            return;
+        }
+        let releases = self.releases.clone();
+        for (index, release) in releases.into_iter().enumerate() {
+            card(ui, palette, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        RichText::new(&release.tag_name)
+                            .monospace()
+                            .size(13.0)
+                            .strong()
+                            .color(palette.fg_default),
+                    );
+                    if let Some(name) = &release.name {
+                        ui.label(RichText::new(name).size(12.0).color(palette.fg_muted));
+                    }
+                    if release.prerelease {
+                        badge(
+                            ui,
+                            self.translator.text(keys::RELEASES_PRERELEASE),
+                            palette.diff_del_bg,
+                            palette.attention_fg,
+                        );
+                    }
+                    if release.draft {
+                        badge(
+                            ui,
+                            self.translator.text(keys::RELEASES_DRAFT),
+                            palette.canvas_inset,
+                            palette.fg_muted,
+                        );
+                    }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new(self.translator.text(keys::COMMON_OPEN_GITHUB))
+                                        .size(11.0)
+                                        .color(palette.accent_fg),
+                                )
+                                .frame(false),
+                            )
+                            .clicked()
+                        {
+                            ui.ctx()
+                                .open_url(egui::OpenUrl::new_tab(release.html_url.clone()));
+                        }
+                    });
+                });
+                ui.horizontal_wrapped(|ui| {
+                    let published = release.published_at.unwrap_or(release.created_at);
+                    ui.label(
+                        RichText::new(self.translator.text_args(
+                            keys::RELEASES_PUBLISHED,
+                            &[Arg::str(
+                                "when",
+                                &format_date(&self.translator, published, false),
+                            )],
+                        ))
+                        .size(10.5)
+                        .color(palette.fg_subtle),
+                    );
+                    if let Some(author) = &release.author {
+                        ui.label(RichText::new(author).size(10.5).color(palette.fg_subtle));
+                    }
+                    ui.label(
+                        RichText::new(self.translator.text_args(
+                            keys::RELEASES_ASSETS,
+                            &[Arg::int("count", release.assets.len() as i64)],
+                        ))
+                        .size(10.5)
+                        .color(palette.fg_subtle),
+                    );
+                });
+                ui.add_space(4.0);
+                egui::CollapsingHeader::new(
+                    RichText::new(self.translator.text(keys::RELEASES_NOTES))
+                        .size(11.5)
+                        .color(palette.fg_muted),
+                )
+                .id_salt(("release-body", release.id))
+                .default_open(index == 0)
+                .show(ui, |ui| {
+                    if let Some(body) = &release.body {
+                        if body.trim().is_empty() {
+                            muted(ui, self.translator.text(keys::RELEASES_NO_BODY), palette);
+                        } else {
+                            markdown(ui, &mut self.markdown_cache, body);
+                        }
+                    } else {
+                        muted(ui, self.translator.text(keys::RELEASES_NO_BODY), palette);
+                    }
+                });
+            });
+            ui.add_space(8.0);
         }
     }
 
@@ -1405,7 +2710,7 @@ impl GitPanelApp {
         ui.add_space(12.0);
         let (commits, additions, deletions) = self
             .db
-            .commit_summary(repository.github_id)
+            .commit_summary_for_branch(repository.github_id, &repository.default_branch)
             .unwrap_or((0, 0, 0));
         repo_stats(ui, &self.translator, commits, additions, deletions, palette);
         ui.add_space(12.0);
@@ -1416,11 +2721,15 @@ impl GitPanelApp {
                 .color(palette.fg_default),
         );
         ui.add_space(4.0);
-        if self.commits.is_empty() {
+        let latest = self
+            .db
+            .list_commits_for_branch(repository.github_id, &repository.default_branch, 5, 0)
+            .unwrap_or_default();
+        if latest.is_empty() {
             muted(ui, self.translator.text(keys::REPOS_NO_COMMITS), palette);
         } else {
-            for commit in self.commits.iter().take(5) {
-                commit_row(ui, commit, &self.translator, palette);
+            for commit in latest {
+                commit_row(ui, &commit, &self.translator, palette);
                 ui.separator();
             }
         }
@@ -1428,6 +2737,47 @@ impl GitPanelApp {
 
     fn commits_panel(&mut self, ui: &mut Ui, repository: &Repository) {
         let palette = self.theme.palette;
+        self.ensure_commits(repository);
+        let mut branch_changed = false;
+        let mut commits_refresh = false;
+        ui.horizontal_wrapped(|ui| {
+            ui.label(
+                RichText::new(self.translator.text(keys::COMMON_BRANCH))
+                    .size(12.0)
+                    .color(palette.fg_muted),
+            );
+            branch_changed = self.branch_combo(ui, repository);
+            source_badge(ui, self.commits_source, &self.translator, palette);
+            if ui
+                .add(secondary_button(
+                    self.translator.text(keys::COMMON_REFRESH),
+                    palette,
+                ))
+                .clicked()
+            {
+                commits_refresh = true;
+            }
+        });
+        if branch_changed {
+            self.ensure_commits(repository);
+        }
+        if commits_refresh {
+            self.commits_error = None;
+            self.commits_source = DataSource::Remote;
+            self.ensure_commits(repository);
+        }
+        if let Some(error) = &self.commits_error {
+            error_banner(
+                ui,
+                &self.translator.text(keys::ERROR_GENERIC),
+                error,
+                palette,
+            );
+        }
+        if self.commits_source == DataSource::Loading {
+            loading(ui, &self.translator.text(keys::COMMITS_LOADING), palette);
+            return;
+        }
         if self.commits.is_empty() {
             empty_state(
                 ui,
@@ -1440,7 +2790,7 @@ impl GitPanelApp {
         }
         let mut open_diff = None;
         ScrollArea::vertical()
-            .id_salt("commits")
+            .id_salt(("commits", self.commits_branch.clone()))
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 for commit in &self.commits {
@@ -1470,7 +2820,7 @@ impl GitPanelApp {
                     ))
                     .clicked()
             {
-                self.load_more_commits(repository.github_id);
+                self.load_more_commits(repository.github_id, &self.commits_branch.clone());
             }
         });
         if let Some(sha) = open_diff {
@@ -2259,15 +3609,21 @@ impl GitPanelApp {
                 self.screen = Screen::Repositories;
                 return;
             };
-            if self.commits_repo != Some(repository.github_id) {
-                self.load_commits(repository.github_id);
-            }
-            if self.repo_tab == RepoTab::Charts && self.charts.repo_id != Some(repository.github_id)
-            {
-                self.load_charts(repository.github_id);
-            }
-            if self.repo_tab == RepoTab::Diff {
-                self.ensure_branches(&repository);
+            match self.repo_tab {
+                RepoTab::Code => self.ensure_code(&repository),
+                RepoTab::Commits => self.ensure_commits(&repository),
+                RepoTab::Branches => self.ensure_branches(&repository),
+                RepoTab::Releases => self.load_releases(&repository, false),
+                RepoTab::Charts => {
+                    if self.charts.repo_id != Some(repository.github_id) {
+                        self.load_charts(repository.github_id);
+                    }
+                }
+                RepoTab::Diff => {
+                    self.ensure_branches(&repository);
+                    self.ensure_commits(&repository);
+                }
+                RepoTab::Overview => {}
             }
         }
         self.refresh_theme(ctx);
@@ -2436,7 +3792,16 @@ impl eframe::App for GitPanelApp {
         egui::CentralPanel::default()
             .frame(panel_frame(self.theme.palette))
             .show(ui, |ui| match self.screen {
-                Screen::Repositories => self.screen_repositories(ui),
+                Screen::Repositories => {
+                    if self.repo_view == RepoView::Grid {
+                        ScrollArea::vertical()
+                            .id_salt("repositories-page")
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| self.screen_repositories(ui));
+                    } else {
+                        self.screen_repositories(ui);
+                    }
+                }
                 Screen::Repository => {
                     ScrollArea::vertical()
                         .id_salt(("repository-scroll", self.scroll_generation))

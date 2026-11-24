@@ -9,6 +9,7 @@ repository.workspace = true
 
 [dependencies]
 chrono.workspace = true
+base64.workspace = true
 gitpanel-core = { path = "../gitpanel-core" }
 reqwest.workspace = true
 serde.workspace = true

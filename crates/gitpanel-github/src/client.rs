@@ -1,17 +1,19 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use chrono::{DateTime, Utc};
 use gitpanel_core::{
-    Account, Branch, CommitData, CommitDiffResult, CompareResult, CreateRepoRequest, FilePatch,
-    RateLimit, Repository,
+    Account, Branch, CommitData, CommitDiffResult, CompareResult, ContentEntry, ContentPayload,
+    CreateRepoRequest, FilePatch, RateLimit, Release, ReleaseAsset, Repository,
 };
 use reqwest::header::{ACCEPT, HeaderMap};
-use reqwest::{Client, RequestBuilder, StatusCode};
+use reqwest::{Client, RequestBuilder, StatusCode, Url};
 use serde_json::{Value, json};
 
 use crate::auth::Token;
-use crate::dto::{BranchDto, CommitDetailDto, CompareDto, FileDto, RepoDto, UserDto};
+use crate::dto::{BranchDto, CommitDetailDto, CompareDto, FileDto, ReleaseDto, RepoDto, UserDto};
 use crate::error::GithubError;
 
 const API_BASE: &str = "https://api.github.com";
@@ -318,6 +320,99 @@ impl GithubClient {
         })
     }
 
+    pub async fn get_contents(
+        &self,
+        owner: &str,
+        repo: &str,
+        path: &str,
+        reference: &str,
+    ) -> Result<ContentPayload, GithubError> {
+        let url = self.contents_url(owner, repo, path, reference)?;
+        let (_, _, body) = self.send(self.http.get(url)).await?;
+        let value: Value = decode(&body, "repository contents")?;
+        content_payload_from_value(&value, path)
+    }
+
+    pub async fn get_readme(
+        &self,
+        owner: &str,
+        repo: &str,
+        reference: &str,
+    ) -> Result<Option<ContentPayload>, GithubError> {
+        let mut url = Url::parse(&format!("{}/repos/{owner}/{repo}/readme", self.api_base))
+            .map_err(|error| GithubError::Decode {
+                context: "readme URL".to_owned(),
+                details: error.to_string(),
+            })?;
+        if !reference.is_empty() {
+            url.query_pairs_mut().append_pair("ref", reference);
+        }
+        let (_, _, body) = match self.send(self.http.get(url)).await {
+            Ok(response) => response,
+            Err(GithubError::NotFound { .. }) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let value: Value = decode(&body, "readme")?;
+        Ok(Some(content_payload_from_value(&value, "")?))
+    }
+
+    pub async fn list_releases(
+        &self,
+        owner: &str,
+        repo: &str,
+    ) -> Result<Vec<Release>, GithubError> {
+        let mut releases = Vec::new();
+        let mut page = 1u32;
+        loop {
+            let page_value = page.to_string();
+            let url = Url::parse(&format!("{}/repos/{owner}/{repo}/releases", self.api_base))
+                .map_err(|error| GithubError::Decode {
+                    context: "releases URL".to_owned(),
+                    details: error.to_string(),
+                })?;
+            let request = self
+                .http
+                .get(url)
+                .query(&[("per_page", "100"), ("page", page_value.as_str())]);
+            let (_, _, body) = self.send(request).await?;
+            let page_items: Vec<ReleaseDto> = decode(&body, "releases")?;
+            let count = page_items.len();
+            releases.extend(page_items.into_iter().map(release_from_dto));
+            if count < PER_PAGE || page >= 100 {
+                break;
+            }
+            page += 1;
+        }
+        Ok(releases)
+    }
+
+    fn contents_url(
+        &self,
+        owner: &str,
+        repo: &str,
+        path: &str,
+        reference: &str,
+    ) -> Result<Url, GithubError> {
+        let mut url = Url::parse(&format!("{}/repos/{owner}/{repo}/contents", self.api_base))
+            .map_err(|error| GithubError::Decode {
+                context: "contents URL".to_owned(),
+                details: error.to_string(),
+            })?;
+        {
+            let mut segments = url.path_segments_mut().map_err(|_| GithubError::Decode {
+                context: "contents URL".to_owned(),
+                details: "URL cannot be a base URL".to_owned(),
+            })?;
+            for part in path.split('/').filter(|part| !part.is_empty()) {
+                segments.push(part);
+            }
+        }
+        if !reference.is_empty() {
+            url.query_pairs_mut().append_pair("ref", reference);
+        }
+        Ok(url)
+    }
+
     async fn send(
         &self,
         request: RequestBuilder,
@@ -375,6 +470,112 @@ fn file_from_dto(dto: FileDto) -> FilePatch {
         changes: dto.changes,
         patch: dto.patch,
     }
+}
+
+fn release_from_dto(dto: ReleaseDto) -> Release {
+    Release {
+        id: dto.id,
+        tag_name: dto.tag_name,
+        name: dto.name,
+        body: dto.body,
+        draft: dto.draft,
+        prerelease: dto.prerelease,
+        created_at: dto.created_at,
+        published_at: dto.published_at,
+        html_url: dto.html_url,
+        author: dto.author.map(|author| author.login),
+        assets: dto
+            .assets
+            .into_iter()
+            .map(|asset| ReleaseAsset {
+                name: asset.name,
+                size: asset.size,
+                download_count: asset.download_count,
+                browser_download_url: asset.browser_download_url,
+            })
+            .collect(),
+    }
+}
+
+fn content_payload_from_value(
+    value: &Value,
+    requested_path: &str,
+) -> Result<ContentPayload, GithubError> {
+    if let Some(items) = value.as_array() {
+        let entries = items.iter().filter_map(content_entry_from_value).collect();
+        return Ok(ContentPayload {
+            path: requested_path.to_owned(),
+            kind: "dir".to_owned(),
+            entries,
+            ..Default::default()
+        });
+    }
+
+    let object = value.as_object().ok_or_else(|| GithubError::Decode {
+        context: "repository contents".to_owned(),
+        details: "expected an object or an array".to_owned(),
+    })?;
+    let kind = object
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("file")
+        .to_owned();
+    let path = object
+        .get("path")
+        .and_then(Value::as_str)
+        .unwrap_or(requested_path)
+        .to_owned();
+    let size = object.get("size").and_then(Value::as_u64);
+    let encoded = object.get("content").and_then(Value::as_str);
+    let (content, binary, truncated) = match encoded {
+        Some(encoded) => {
+            let compact: String = encoded.chars().filter(|ch| !ch.is_whitespace()).collect();
+            match BASE64.decode(compact) {
+                Ok(bytes) => match String::from_utf8(bytes) {
+                    Ok(text) => (Some(text), false, false),
+                    Err(_) => (None, true, false),
+                },
+                Err(_) => (None, false, true),
+            }
+        }
+        None => (None, false, size.unwrap_or(0) > 0),
+    };
+    Ok(ContentPayload {
+        path,
+        kind,
+        sha: object.get("sha").and_then(Value::as_str).map(str::to_owned),
+        size,
+        content,
+        entries: Vec::new(),
+        html_url: object
+            .get("html_url")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        truncated,
+        binary,
+    })
+}
+
+fn content_entry_from_value(value: &Value) -> Option<ContentEntry> {
+    Some(ContentEntry {
+        name: value.get("name")?.as_str()?.to_owned(),
+        path: value.get("path")?.as_str()?.to_owned(),
+        sha: value.get("sha")?.as_str()?.to_owned(),
+        kind: value
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("file")
+            .to_owned(),
+        size: value.get("size").and_then(Value::as_u64),
+        html_url: value
+            .get("html_url")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        download_url: value
+            .get("download_url")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+    })
 }
 
 fn parse_rate_limit(value: &Value) -> Option<RateLimit> {
@@ -569,5 +770,96 @@ mod tests {
             page.rate_limit.as_ref().map(|rate| rate.remaining),
             Some(4999)
         );
+    }
+
+    #[tokio::test]
+    async fn reads_directory_contents() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/MiguelSilvaPorto/gitpanel/contents"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {
+                    "name": "src",
+                    "path": "src",
+                    "sha": "dir-sha",
+                    "type": "dir",
+                    "size": 0,
+                    "html_url": "https://github.com/MiguelSilvaPorto/gitpanel/tree/main/src"
+                },
+                {
+                    "name": "README.md",
+                    "path": "README.md",
+                    "sha": "file-sha",
+                    "type": "file",
+                    "size": 12,
+                    "html_url": "https://github.com/MiguelSilvaPorto/gitpanel/blob/main/README.md"
+                }
+            ])))
+            .mount(&server)
+            .await;
+        let client = GithubClient::with_base(Token::new("test"), server.uri()).expect("client");
+        let payload = client
+            .get_contents("MiguelSilvaPorto", "gitpanel", "", "main")
+            .await
+            .expect("contents");
+        assert!(payload.is_dir());
+        assert_eq!(payload.entries.len(), 2);
+        assert_eq!(payload.entries[0].kind, "dir");
+    }
+
+    #[tokio::test]
+    async fn reads_file_contents() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/MiguelSilvaPorto/gitpanel/contents/README.md"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": "README.md",
+                "path": "README.md",
+                "sha": "file-sha",
+                "type": "file",
+                "size": 5,
+                "encoding": "base64",
+                "content": "SGVsbG8=",
+                "html_url": "https://github.com/MiguelSilvaPorto/gitpanel/blob/main/README.md"
+            })))
+            .mount(&server)
+            .await;
+        let client = GithubClient::with_base(Token::new("test"), server.uri()).expect("client");
+        let payload = client
+            .get_contents("MiguelSilvaPorto", "gitpanel", "README.md", "main")
+            .await
+            .expect("file");
+        assert_eq!(payload.content.as_deref(), Some("Hello"));
+        assert!(!payload.binary);
+    }
+
+    #[tokio::test]
+    async fn lists_releases() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/MiguelSilvaPorto/gitpanel/releases"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([{
+                "id": 1,
+                "tag_name": "v0.1.0",
+                "name": "First",
+                "body": "Notes",
+                "draft": false,
+                "prerelease": false,
+                "created_at": "2026-01-01T00:00:00Z",
+                "published_at": "2026-01-02T00:00:00Z",
+                "html_url": "https://github.com/MiguelSilvaPorto/gitpanel/releases/tag/v0.1.0",
+                "author": { "login": "MiguelSilvaPorto" },
+                "assets": [{ "name": "app", "size": 10, "download_count": 3, "browser_download_url": "https://example.com/app" }]
+            }])))
+            .mount(&server)
+            .await;
+        let client = GithubClient::with_base(Token::new("test"), server.uri()).expect("client");
+        let releases = client
+            .list_releases("MiguelSilvaPorto", "gitpanel")
+            .await
+            .expect("releases");
+        assert_eq!(releases.len(), 1);
+        assert_eq!(releases[0].tag_name, "v0.1.0");
+        assert_eq!(releases[0].assets.len(), 1);
     }
 }

@@ -69,6 +69,21 @@ CREATE TABLE IF NOT EXISTS diff_cache (
     PRIMARY KEY (repo_id, base_sha, head_sha)
 );
 
+CREATE TABLE IF NOT EXISTS content_cache (
+    repo_id INTEGER NOT NULL REFERENCES repos(github_id) ON DELETE CASCADE,
+    branch TEXT NOT NULL,
+    path TEXT NOT NULL,
+    payload TEXT NOT NULL,
+    fetched_at TEXT NOT NULL,
+    PRIMARY KEY (repo_id, branch, path)
+);
+
+CREATE TABLE IF NOT EXISTS release_cache (
+    repo_id INTEGER PRIMARY KEY REFERENCES repos(github_id) ON DELETE CASCADE,
+    payload TEXT NOT NULL,
+    fetched_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS sync_runs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     started_at TEXT NOT NULL,
@@ -315,6 +330,81 @@ impl Db {
         rows.collect::<Result<Vec<_>, _>>().map_err(DbError::from)
     }
 
+    pub fn list_commits_for_branch(
+        &self,
+        repo_id: i64,
+        branch: &str,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<Commit>, DbError> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT repo_id, sha, author_login, author_name, author_email, committed_at,
+                    message, additions, deletions, branch, is_merge
+             FROM commits
+             WHERE repo_id = ?1 AND branch = ?2
+             ORDER BY committed_at DESC, sha
+             LIMIT ?3 OFFSET ?4",
+        )?;
+        let rows = statement.query_map(
+            params![repo_id, branch, limit as i64, offset as i64],
+            row_to_commit,
+        )?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(DbError::from)
+    }
+
+    pub fn list_all_commits_for_branch(
+        &self,
+        repo_id: i64,
+        branch: &str,
+    ) -> Result<Vec<Commit>, DbError> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT repo_id, sha, author_login, author_name, author_email, committed_at,
+                    message, additions, deletions, branch, is_merge
+             FROM commits
+             WHERE repo_id = ?1 AND branch = ?2
+             ORDER BY committed_at ASC, sha",
+        )?;
+        let rows = statement.query_map(params![repo_id, branch], row_to_commit)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(DbError::from)
+    }
+
+    pub fn count_commits_for_branch(&self, repo_id: i64, branch: &str) -> Result<u32, DbError> {
+        let connection = self.connection()?;
+        let count: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM commits WHERE repo_id = ?1 AND branch = ?2",
+            params![repo_id, branch],
+            |row| row.get(0),
+        )?;
+        Ok(count.max(0) as u32)
+    }
+
+    pub fn commit_summary_for_branch(
+        &self,
+        repo_id: i64,
+        branch: &str,
+    ) -> Result<(u32, u64, u64), DbError> {
+        let connection = self.connection()?;
+        let (count, additions, deletions) = connection.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(additions), 0), COALESCE(SUM(deletions), 0)
+             FROM commits WHERE repo_id = ?1 AND branch = ?2",
+            params![repo_id, branch],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        )?;
+        Ok((
+            count.max(0) as u32,
+            additions.max(0) as u64,
+            deletions.max(0) as u64,
+        ))
+    }
+
     pub fn list_all_commits(&self, repo_id: i64) -> Result<Vec<Commit>, DbError> {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
@@ -435,6 +525,68 @@ impl Db {
                 payload,
                 Utc::now().to_rfc3339()
             ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_content_cache(
+        &self,
+        repo_id: i64,
+        branch: &str,
+        path: &str,
+    ) -> Result<Option<String>, DbError> {
+        let connection = self.connection()?;
+        connection
+            .query_row(
+                "SELECT payload FROM content_cache
+                 WHERE repo_id = ?1 AND branch = ?2 AND path = ?3",
+                params![repo_id, branch, path],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(DbError::from)
+    }
+
+    pub fn put_content_cache(
+        &self,
+        repo_id: i64,
+        branch: &str,
+        path: &str,
+        payload: &str,
+    ) -> Result<(), DbError> {
+        let connection = self.connection()?;
+        connection.execute(
+            "INSERT INTO content_cache (repo_id, branch, path, payload, fetched_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(repo_id, branch, path) DO UPDATE SET
+                payload = excluded.payload,
+                fetched_at = excluded.fetched_at",
+            params![repo_id, branch, path, payload, Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_release_cache(&self, repo_id: i64) -> Result<Option<String>, DbError> {
+        let connection = self.connection()?;
+        connection
+            .query_row(
+                "SELECT payload FROM release_cache WHERE repo_id = ?1",
+                [repo_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(DbError::from)
+    }
+
+    pub fn put_release_cache(&self, repo_id: i64, payload: &str) -> Result<(), DbError> {
+        let connection = self.connection()?;
+        connection.execute(
+            "INSERT INTO release_cache (repo_id, payload, fetched_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(repo_id) DO UPDATE SET
+                payload = excluded.payload,
+                fetched_at = excluded.fetched_at",
+            params![repo_id, payload, Utc::now().to_rfc3339()],
         )?;
         Ok(())
     }
@@ -644,5 +796,37 @@ mod tests {
         assert_eq!(repos.len(), 1);
         assert_eq!(repos[0].github_id, 1);
         assert_eq!(db.count_commits(2).expect("count"), 0);
+    }
+
+    #[test]
+    fn caches_branch_commits_contents_and_releases() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db = Db::open(temp.path().join("test.db")).expect("db");
+        db.upsert_repositories(&[repo()]).expect("repo");
+        db.upsert_commits(1, "main", &[commit("main-commit")])
+            .expect("main");
+        db.upsert_commits(1, "feature", &[commit("feature-commit")])
+            .expect("feature");
+        assert_eq!(
+            db.count_commits_for_branch(1, "main").expect("main count"),
+            1
+        );
+        assert_eq!(
+            db.list_commits_for_branch(1, "feature", 10, 0)
+                .expect("feature list")[0]
+                .sha,
+            "feature-commit"
+        );
+        db.put_content_cache(1, "main", "", "{\"kind\":\"dir\"}")
+            .expect("contents");
+        assert_eq!(
+            db.get_content_cache(1, "main", "").expect("contents get"),
+            Some("{\"kind\":\"dir\"}".to_owned())
+        );
+        db.put_release_cache(1, "[]").expect("releases");
+        assert_eq!(
+            db.get_release_cache(1).expect("releases get"),
+            Some("[]".to_owned())
+        );
     }
 }

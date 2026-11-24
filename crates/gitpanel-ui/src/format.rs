@@ -98,6 +98,16 @@ pub fn compact_number(value: u64) -> String {
     }
 }
 
+pub fn format_bytes(value: u64) -> String {
+    if value < 1024 {
+        format!("{value} B")
+    } else if value < 1024 * 1024 {
+        format!("{:.1} KiB", value as f64 / 1024.0)
+    } else {
+        format!("{:.1} MiB", value as f64 / (1024.0 * 1024.0))
+    }
+}
+
 pub fn language_color(language: &str) -> Color32 {
     match language {
         "Rust" => Color32::from_rgb(222, 165, 132),

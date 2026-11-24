@@ -68,6 +68,63 @@ pub struct Branch {
     pub protected: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContentEntry {
+    pub name: String,
+    pub path: String,
+    pub sha: String,
+    pub kind: String,
+    pub size: Option<u64>,
+    pub html_url: Option<String>,
+    pub download_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ContentPayload {
+    pub path: String,
+    pub kind: String,
+    pub sha: Option<String>,
+    pub size: Option<u64>,
+    pub content: Option<String>,
+    pub entries: Vec<ContentEntry>,
+    pub html_url: Option<String>,
+    pub truncated: bool,
+    pub binary: bool,
+}
+
+impl ContentPayload {
+    pub fn is_dir(&self) -> bool {
+        self.kind == "dir"
+    }
+
+    pub fn is_file(&self) -> bool {
+        self.kind == "file"
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReleaseAsset {
+    pub name: String,
+    pub size: u64,
+    pub download_count: u64,
+    pub browser_download_url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Release {
+    pub id: i64,
+    pub tag_name: String,
+    pub name: Option<String>,
+    pub body: Option<String>,
+    pub draft: bool,
+    pub prerelease: bool,
+    pub created_at: DateTime<Utc>,
+    pub published_at: Option<DateTime<Utc>>,
+    pub html_url: String,
+    pub author: Option<String>,
+    pub assets: Vec<ReleaseAsset>,
+}
+
 /// Commit data as delivered by GitHub, before it is associated with a repository.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommitData {

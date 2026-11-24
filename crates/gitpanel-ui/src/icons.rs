@@ -20,6 +20,10 @@ pub enum Icon {
     External,
     Chart,
     Diff,
+    Cloud,
+    Local,
+    Folder,
+    File,
 }
 
 pub fn icon_button(ui: &mut Ui, icon: Icon, tooltip: &str) -> Response {
@@ -300,6 +304,88 @@ pub fn draw(ui: &Ui, icon: Icon, rect: Rect, color: Color32) {
                 [
                     Pos2::new(center.x - 2.0, r.bottom() - 4.0),
                     Pos2::new(r.right(), r.bottom() - 4.0),
+                ],
+                stroke,
+            );
+        }
+        Icon::Cloud => {
+            painter.circle_stroke(
+                Pos2::new(center.x - 5.0, center.y + 1.0),
+                r.width() * 0.24,
+                stroke,
+            );
+            painter.circle_stroke(
+                Pos2::new(center.x + 2.0, center.y - 2.0),
+                r.width() * 0.32,
+                stroke,
+            );
+            painter.circle_stroke(
+                Pos2::new(center.x + 7.0, center.y + 2.0),
+                r.width() * 0.2,
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    Pos2::new(r.left() + 1.0, center.y + 5.0),
+                    Pos2::new(r.right() - 1.0, center.y + 5.0),
+                ],
+                stroke,
+            );
+        }
+        Icon::Local => {
+            painter.rect_stroke(r, 3.0, stroke, egui::StrokeKind::Inside);
+            painter.line_segment(
+                [
+                    Pos2::new(r.left() + 3.0, center.y - 4.0),
+                    Pos2::new(r.right() - 3.0, center.y - 4.0),
+                ],
+                stroke,
+            );
+            painter.circle_filled(Pos2::new(r.right() - 4.0, center.y + 3.0), 1.5, color);
+        }
+        Icon::Folder => {
+            painter.rect_stroke(
+                Rect::from_min_max(
+                    Pos2::new(r.left(), r.top() + 3.0),
+                    Pos2::new(r.right(), r.bottom()),
+                ),
+                2.0,
+                stroke,
+                egui::StrokeKind::Inside,
+            );
+            painter.add(Shape::line(
+                vec![
+                    Pos2::new(r.left(), r.top() + 3.0),
+                    Pos2::new(r.left(), r.top()),
+                    Pos2::new(r.left() + 6.0, r.top()),
+                    Pos2::new(r.left() + 8.0, r.top() + 3.0),
+                ],
+                stroke,
+            ));
+        }
+        Icon::File => {
+            painter.add(Shape::line(
+                vec![
+                    Pos2::new(r.left() + 2.0, r.top()),
+                    Pos2::new(r.right() - 5.0, r.top()),
+                    Pos2::new(r.right(), r.top() + 5.0),
+                    Pos2::new(r.right(), r.bottom()),
+                    Pos2::new(r.left() + 2.0, r.bottom()),
+                    Pos2::new(r.left() + 2.0, r.top()),
+                ],
+                stroke,
+            ));
+            painter.line_segment(
+                [
+                    Pos2::new(r.right() - 5.0, r.top()),
+                    Pos2::new(r.right() - 5.0, r.top() + 5.0),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    Pos2::new(r.right() - 5.0, r.top() + 5.0),
+                    Pos2::new(r.right(), r.top() + 5.0),
                 ],
                 stroke,
             );
